@@ -1,0 +1,22 @@
+2025-09-28 02:07:29,557 - ALD_Controller - INFO - Testing logging system
+2025-09-28 02:07:29,559 - ALD_Controller - WARNING - This is a test warning
+2025-09-28 02:07:29,559 - ALD_Controller - ERROR - This is a test error
+2025-09-28 02:15:33,568 - INFO - Connecting to COM3...
+2025-09-28 02:15:33,569 - ERROR - Connection failed: could not open port 'COM3': FileNotFoundError(2, 'The system cannot find the file specified.', None, 2)
+2025-09-28 02:15:33,569 - INFO - Disconnected
+2025-09-29 13:23:55,035 - INFO - Connecting to COM3...
+2025-09-29 13:23:55,035 - ERROR - Connection failed: could not open port 'COM3': FileNotFoundError(2, 'The system cannot find the file specified.', None, 2)
+2025-09-29 13:23:55,035 - INFO - Disconnected
+2025-09-29 13:25:49,332 - INFO - Connecting to COM3...
+2025-09-29 13:25:49,333 - ERROR - Connection failed: could not open port 'COM3': FileNotFoundError(2, 'The system cannot find the file specified.', None, 2)
+2025-09-29 13:25:49,335 - INFO - Disconnected
+2025-09-29 13:26:48,984 - INFO - Connecting to COM15...
+2025-09-29 13:26:49,070 - INFO - Connected to COM15
+2025-09-29 13:26:50,513 - INFO - Received: Setup complete!
+2025-09-29 13:26:50,515 - ERROR - Read error: object NoneType can't be used in 'await' expression
+2025-09-29 13:27:03,744 - INFO - Sent: TEST
+2025-09-29 13:27:14,009 - INFO - Sent: v1;2;2;2
+2025-09-29 13:27:19,876 - INFO - Sent: t2.0;2.0;2.0;2.0
+2025-09-29 13:27:27,834 - INFO - Sent: v1;1;1;1
+2025-09-29 13:27:31,936 - INFO - Sent: BEGIN
+2025-09-29 13:27:37,815 - INFO - Disconnected
