@@ -447,10 +447,11 @@ class ALDMainWindow(QMainWindow):
     @asyncSlot()
     async def send_temp(self):
         try:
-            tc2 = float(self.tc2_input.text())
-            tc3 = float(self.tc3_input.text())
-            tc4 = float(self.tc4_input.text())
-            tc5 = float(self.tc5_input.text())
+            # Convert to int since Arduino expects int, not float
+            tc2 = int(float(self.tc2_input.text()))
+            tc3 = int(float(self.tc3_input.text()))
+            tc4 = int(float(self.tc4_input.text()))
+            tc5 = int(float(self.tc5_input.text()))
             
             await self.controller.temp(tc2, tc3, tc4, tc5)
             self.log_text.append(f"Sent: t{tc2};{tc3};{tc4};{tc5}")
