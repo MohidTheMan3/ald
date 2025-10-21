@@ -4,7 +4,7 @@
 // Useful for testing individual components of the ALD system.
 
 // CMU Hacker Fab 2025
-// Joel Gonzalez, Haewon Uhm
+// Joel Gonzalez, Haewon Uhm, Atharva Raut
 
 // toggle this if you want the system to do nothing
 #define DO_NOTHING 0
@@ -88,9 +88,9 @@ void setup()
   digitalWrite(RELAY2_PIN, HIGH);
   digitalWrite(RELAY3_PIN, HIGH);
   digitalWrite(RELAY4_PIN, HIGH);
-  digitalWrite(RELAY6_PIN, HIGH);
-  digitalWrite(RELAY7_PIN, HIGH);
-  digitalWrite(RELAY8_PIN, HIGH);
+  digitalWrite(RELAY6_PIN, LOW);
+  digitalWrite(RELAY7_PIN, LOW);
+  digitalWrite(RELAY8_PIN, LOW);  // Active HIGH MOSFET
 
   // K-type: pins 3,4,5,6
   // J-type: pins 7,8,9,10
@@ -106,7 +106,7 @@ void setup()
 
 // takes moving average of thermocouple data
 void readThermocouples()
-{	
+{ 
   for (int i=0; i<7; ++i)
   {
     double curr_val = thermocouples[i].readCelsius();
@@ -182,53 +182,54 @@ void actuateHeatingElements()
 
 void precursorValveActuation()
 {
-  switch(which_valve)
+  // actual purge time between pulses may be slightly higher when using "if" conditional instead of "when"
+  if(num_pulse>0)
   {
-    case 1:
-      while(num_pulse>0)
-      {
+    switch(which_valve)
+    {
+      case 1:
         Serial.println("V: Pulsing valve 1");
-        digitalWrite(RELAY6_PIN, LOW);
-        delay(pulse_time);
-
-        Serial.println("V: Purging line");
         digitalWrite(RELAY6_PIN, HIGH);
+        delay(pulse_time);
+
+        Serial.println("V: Purging line");
+        digitalWrite(RELAY6_PIN, LOW);
         delay(purge_time);
         num_pulse--;
-      }
-      break;
+        break;
 
-    case 2:
-      while(num_pulse>0)
-      {
+      case 2:
         Serial.println("V: Pulsing valve 2");
-        digitalWrite(RELAY7_PIN, LOW);
-        delay(pulse_time);
-
-        Serial.println("V: Purging line");
         digitalWrite(RELAY7_PIN, HIGH);
-        delay(purge_time);
-        num_pulse--;
-      }
-      break;
-
-    case 3:
-      while(num_pulse>0)
-      {
-        Serial.println("V: Pulsing valve 3");
-        digitalWrite(RELAY8_PIN, LOW);
         delay(pulse_time);
 
         Serial.println("V: Purging line");
-        digitalWrite(RELAY8_PIN, HIGH);
+        digitalWrite(RELAY7_PIN, LOW);
         delay(purge_time);
         num_pulse--;
-      }
-      break;
+        break;
 
-    default:
-      Serial.println("V: No valve selected");
-      return;
+      case 3:
+        Serial.println("V: Pulsing valve 3");
+        digitalWrite(RELAY8_PIN, HIGH);
+        delay(pulse_time);
+
+        Serial.println("V: Purging line");
+        digitalWrite(RELAY8_PIN, LOW);
+        delay(purge_time);
+        num_pulse--;
+        break;
+
+      default:
+        Serial.println("V: No valve selected");
+        return;
+    }
+  } else
+  { 
+    // close valves when no pulses required (precautionary)
+    digitalWrite(RELAY6_PIN, LOW);
+    digitalWrite(RELAY7_PIN, LOW);
+    digitalWrite(RELAY8_PIN, LOW);
   }
 }
 
@@ -242,39 +243,80 @@ void loop()
     String inputString = Serial.readStringUntil('\n'); // Read until newline character
     strcpy(s, inputString.c_str());
     
-    // s = "t;100;200;150;90"; // example temp. command
-    // s = "v;2;5;1000;3000"; // example valve command
+    // s = "s";              // STOP command: exit loop 
+    // s = "r";              // RESET command: reset pulse counter 
+    // s = "t;100;200;150;90";  // example temp. command
+    // s = "v;2;5;1000;3000";   // example valve command
 
     Serial.println(s);
     int result = 0;
 
-    // temperature command
-    if (s[0] == 't')
+    // stop command
+    if (s[0] == 's')
     {
-      tc_active = 1;
-      result = sscanf(s, "t%d;%d;%d;%d", &temp_sp2, &temp_sp3, &temp_sp4, &temp_sp5);
-    } else if (s[0] == 'v') // ALD valve command
+      Serial.println("EMERGENCY STOP command received! Closing all valves, Stopping heating! Shutdown");
+      digitalWrite(RELAY1_PIN, HIGH);
+      digitalWrite(RELAY2_PIN, HIGH);
+      digitalWrite(RELAY3_PIN, HIGH);
+      digitalWrite(RELAY4_PIN, HIGH);
+      digitalWrite(RELAY6_PIN, LOW);
+      digitalWrite(RELAY7_PIN, LOW);
+      digitalWrite(RELAY8_PIN, LOW);  // Active HIGH MOSFET
+      while(1){
+        // do nothing - EMERGENCY STOP state
+        // need to restart program to recover from this state
+      }
+    }
+    // reset command
+    else if (s[0] == 'r')
     {
-      result = sscanf(s, "v%u;%u;%u;%u", &which_valve, &num_pulse, &pulse_time, &purge_time);    
+      num_pulse = 0;
+      which_valve = 0;
+      Serial.println("RESET command received! Resetting state!");
     } else
     {
-      Serial.println("INVALID COMMAND!");
-      return;
-    }
+      // temperature command
+      if (s[0] == 't')
+      {
+        tc_active = 1;
+        result = sscanf(s, "t%d;%d;%d;%d", &temp_sp2, &temp_sp3, &temp_sp4, &temp_sp5);
+      } else if (s[0] == 'v') // ALD valve command
+      {
+        if (num_pulse != 0)
+        {
+          Serial.println("COMMAND IGNORED. Wait for previous command to finish, or issue RESET.")
+        } else
+        {
+          result = sscanf(s, "v%u;%u;%u;%u", &which_valve, &num_pulse, &pulse_time, &purge_time);    
+        }
+      } else
+      {
+        Serial.println("INVALID COMMAND!");
+        return;
+      }
 
-    // unable to parse command-line input properly
-    if (result != 4)
-    {
-      Serial.println("MISFORMATTED COMMAND! sscanf result: ");
-      Serial.println(result);
-      return;
-    } else {
-      Serial.println("Starting command!");
+      // unable to parse command-line input properly
+      if (result != 4)
+      {
+        Serial.println("MISFORMATTED COMMAND! sscanf result: ");
+        Serial.println(result);
+        return;
+      } else {
+        Serial.println("Starting command!");
+      }
     }
-
-    // ALD valve actuation
-    precursorValveActuation();
   }
+  
+  // ALD valve actuation
+  // moved outside the conditional so it runs passively when nothing in serial port
+  precursorValveActuation();
+  if (num_pulse == 0)
+  {
+    Serial.println("Previous command has completed. Ready for new command.")
+  }
+  // need to ensure that python doesn't send new command till acknowledgement is received
+  // TODO: @Modid, suggest best method to convey it back to python
+  // Current implementation: simply ignore new pulse commands when previous is ongoing
 
   // heating control loop
   readThermocouples();

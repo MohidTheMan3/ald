@@ -1,6 +1,7 @@
 import asyncio
 import serial_asyncio
 import logging
+from ald_models import ValveCommand, TempCommand
 
 class ALDController:
     def __init__(self):
