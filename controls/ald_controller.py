@@ -107,11 +107,14 @@ class ALDController:
             try:
                 data = await self.read_line()
                 if data and self.message_callback:
-                    await self.message_callback(data)
+                    # Call callback - don't await it
+                    self.message_callback(data)
                     
             except Exception as e:
                 if self.connected:
                     self.logger.error(f"Read error: {e}")
+                    import traceback
+                    traceback.print_exc()
                 break
             
             await asyncio.sleep(0.01)
@@ -127,12 +130,31 @@ class ALDController:
         await self.send("TEST")
         
     async def valve(self, valve_id, num_pulses, pulse_time, purge_time):
-        cmd = f"v{valve_id};{num_pulses};{pulse_time};{purge_time}"
+        # Validate with Pydantic
+        cmd_obj = ValveCommand(
+            valve_id=valve_id,
+            num_pulses=num_pulses,
+            pulse_time_ms=pulse_time,
+            purge_time_ms=purge_time
+        )
+        cmd = f"v{cmd_obj.valve_id};{cmd_obj.num_pulses};{cmd_obj.pulse_time_ms};{cmd_obj.purge_time_ms}"
         await self.send(cmd)
     
     async def temp(self, tc2, tc3, tc4, tc5):
-        cmd = f"t{tc2};{tc3};{tc4};{tc5}"
+        # Validate with Pydantic
+        cmd_obj = TempCommand(tc2=tc2, tc3=tc3, tc4=tc4, tc5=tc5)
+        cmd = f"t{cmd_obj.tc2};{cmd_obj.tc3};{cmd_obj.tc4};{cmd_obj.tc5}"
         await self.send(cmd)
     
     async def begin(self):
         await self.send("BEGIN")
+    
+    async def estop(self):
+        """Emergency stop - locks system, requires restart"""
+        await self.send("s")
+        self.logger.critical("EMERGENCY STOP - System locked, Arduino needs restart")
+    
+    async def reset(self):
+        """Reset pulse counter without emergency stop"""
+        await self.send("r")
+        self.logger.info("Reset command sent - pulse counter cleared")
