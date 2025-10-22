@@ -423,9 +423,6 @@ Your input is outside the valid range:
 - Batch processing
 - Web interface for remote monitoring
 - Better safety features
-- Electronic lab notebook integration
-- Mobile app (maybe?)
-- Cloud backup
 
 ---
 
