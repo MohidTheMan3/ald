@@ -1,0 +1,22 @@
+# ALD Control System Dependencies
+# Install with: pip install -r requirements.txt
+
+# GUI Framework
+PyQt6>=6.6.0
+PyQt6-Charts>=6.6.0
+
+# Async/Event Loop
+qasync>=0.24.0
+
+# Data Validation
+pydantic>=2.5.0
+
+# Serial Communication
+pyserial-asyncio>=0.6.0
+
+# Testing
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+
+# Configuration
+pyyaml>=6.0.0
