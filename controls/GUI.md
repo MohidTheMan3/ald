@@ -428,7 +428,7 @@ Your input is outside the valid range:
 
 ## Contact
 
-**Author:** Mohid Hassan  
+**Author:** Mohid Rattu
 **Email:** hackerfab@cmu.edu  
 **GitHub:** [github.com/MohidTheMan3/ald](https://github.com/MohidTheMan3/ald/tree/gui-revamp)
 
