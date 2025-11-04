@@ -1,9 +1,11 @@
 import sys
 import asyncio
+import csv
+from datetime import datetime
 from collections import deque
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QLabel, QLineEdit, QPushButton, 
-                            QTextEdit, QTabWidget, QGroupBox, QMessageBox)
+                            QTextEdit, QTabWidget, QGroupBox, QMessageBox, QFileDialog)
 from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtGui import QColor, QPalette
 from PyQt6.QtCharts import QChart, QChartView, QLineSeries, QValueAxis
@@ -20,13 +22,17 @@ class ALDMainWindow(QMainWindow):
         
         # Temperature data storage
         self.temp_data = {
-            'tc2': deque(maxlen=100),
-            'tc3': deque(maxlen=100),
-            'tc4': deque(maxlen=100),
-            'tc5': deque(maxlen=100),
-            'time': deque(maxlen=100)
+            'tc2': deque(maxlen=1000),  # Increased from 100 to keep more history
+            'tc3': deque(maxlen=1000),
+            'tc4': deque(maxlen=1000),
+            'tc5': deque(maxlen=1000),
+            'time': deque(maxlen=1000)
         }
         self.time_counter = 0
+        self.valve_job_running = False  # Track if valve job is active
+        
+        # Command history for optional CSV export
+        self.command_history = []
         
         self.setup_ui()
         
@@ -74,13 +80,14 @@ class ALDMainWindow(QMainWindow):
         """Handle status messages from Arduino"""
         msg_lower = msg.lower()
         
-        # Command acknowledgment
-        if "previous command has completed" in msg_lower:
-            # System ready for new commands
-            pass
+        # Command acknowledgment - job completed
+        if "previous command has completed" in msg_lower or "ready for new command" in msg_lower:
+            self.valve_job_running = False
+            self.log_text.append(f"[DEBUG] Set valve_job_running = False (job complete)")
         
         # Command ignored (overlap detected)
         elif "command ignored" in msg_lower:
+            self.log_text.append(f"[DEBUG] Arduino ignored command")
             QMessageBox.warning(
                 self,
                 "Command Ignored",
@@ -90,12 +97,15 @@ class ALDMainWindow(QMainWindow):
         
         # Emergency stop confirmation
         elif "emergency stop" in msg_lower and "received" in msg_lower:
+            self.valve_job_running = False
+            self.log_text.append(f"[DEBUG] Set valve_job_running = False (emergency stop)")
             self.status_label.setText("🚨 EMERGENCY STOP ACTIVE")
             self.status_label.setStyleSheet("background-color: #c0392b; color: white; padding: 10px; font-weight: bold;")
         
         # Reset confirmation  
         elif "reset command received" in msg_lower:
-            pass  # Already handled in reset_system method
+            self.valve_job_running = False
+            self.log_text.append(f"[DEBUG] Set valve_job_running = False (reset)")
     
     def setup_ui(self):
         self.setWindowTitle("ALD Control System")
@@ -275,6 +285,14 @@ class ALDMainWindow(QMainWindow):
         readings_group.setLayout(readings_layout)
         layout.addWidget(readings_group)
         
+        # Export button
+        export_layout = QHBoxLayout()
+        export_btn = QPushButton("Export Temperature Data to CSV")
+        export_btn.clicked.connect(self.export_temperature_data)
+        export_layout.addWidget(export_btn)
+        export_layout.addStretch()
+        layout.addLayout(export_layout)
+        
         # Temperature graph
         self.setup_temperature_chart()
         layout.addWidget(self.chart_view)
@@ -305,10 +323,11 @@ class ALDMainWindow(QMainWindow):
         self.chart.addSeries(self.tc4_series)
         self.chart.addSeries(self.tc5_series)
         
-        # Setup axes
+        # Setup axes - Always start from 0
         self.axis_x = QValueAxis()
-        self.axis_x.setTitleText("Time (samples)")
+        self.axis_x.setTitleText("Sample Number")
         self.axis_x.setRange(0, 100)
+        self.axis_x.setLabelFormat("%d")
         
         self.axis_y = QValueAxis()
         self.axis_y.setTitleText("Temperature (°C)")
@@ -342,7 +361,7 @@ class ALDMainWindow(QMainWindow):
         self.tc4_series.clear()
         self.tc5_series.clear()
         
-        # Add points
+        # Add all points from sample 0 onwards
         for i, t in enumerate(self.temp_data['time']):
             self.tc2_series.append(t, self.temp_data['tc2'][i])
             self.tc3_series.append(t, self.temp_data['tc3'][i])
@@ -362,15 +381,14 @@ class ALDMainWindow(QMainWindow):
         if all_temps:
             min_temp = min(all_temps)
             max_temp = max(all_temps)
-            range_temp = max_temp - min_temp
+            range_temp = max_temp - min_temp if max_temp > min_temp else 10
             self.axis_y.setRange(max(0, min_temp - range_temp * 0.1), 
                                 max_temp + range_temp * 0.1)
         
-        # Auto-scale X axis
+        # X axis always starts from 0, shows all data
         if len(self.temp_data['time']) > 0:
-            min_time = min(self.temp_data['time'])
             max_time = max(self.temp_data['time'])
-            self.axis_x.setRange(min_time, max_time + 1)
+            self.axis_x.setRange(0, max(max_time + 1, 100))  # At least 100 for initial view
     
     def setup_log_tab(self):
         widget = QWidget()
@@ -388,6 +406,14 @@ class ALDMainWindow(QMainWindow):
         h.addWidget(begin_btn)
         
         layout.addLayout(h)
+        
+        # Export command log button
+        export_log_layout = QHBoxLayout()
+        export_log_btn = QPushButton("Export Command Log to CSV")
+        export_log_btn.clicked.connect(self.export_command_log)
+        export_log_layout.addWidget(export_log_btn)
+        export_log_layout.addStretch()
+        layout.addLayout(export_log_layout)
         
         # Full log
         layout.addWidget(QLabel("Full Communication Log:"))
@@ -428,24 +454,59 @@ class ALDMainWindow(QMainWindow):
     
     @asyncSlot()
     async def send_valve(self):
+        # Check if job already running
+        if self.valve_job_running:
+            self.log_text.append(f"[DEBUG] Blocked valve command - job already running")
+            QMessageBox.warning(
+                self,
+                "Job Already Running",
+                "A valve command is already in progress.\n\n"
+                "Please wait for it to complete or click 'Reset Valves' to cancel."
+            )
+            return
+        
         try:
             valve_id = int(self.valve_id_input.text())
             num_pulses = int(self.num_pulses_input.text())
             pulse_time = int(self.pulse_time_input.text())
             purge_time = int(self.purge_time_input.text())
             
+            self.valve_job_running = True
+            self.log_text.append(f"[DEBUG] Set valve_job_running = True")
+            
             await self.controller.valve(valve_id, num_pulses, pulse_time, purge_time)
-            self.log_text.append(f"Sent: v{valve_id};{num_pulses};{pulse_time};{purge_time}")
+            
+            cmd_str = f"v{valve_id};{num_pulses};{pulse_time};{purge_time}"
+            self.log_text.append(f"Sent: {cmd_str}")
+            self.log_command('VALVE', cmd_str, f'Valve {valve_id}, {num_pulses} pulses')
             
         except ValidationError as e:
+            self.valve_job_running = False
             QMessageBox.warning(self, "Validation Error", str(e))
         except ValueError:
+            self.valve_job_running = False
             QMessageBox.warning(self, "Input Error", "Please enter valid numbers")
         except Exception as e:
+            self.valve_job_running = False
             QMessageBox.critical(self, "Error", str(e))
     
     @asyncSlot()
     async def send_temp(self):
+        # Warn if valve job is running
+        if self.valve_job_running:
+            reply = QMessageBox.question(
+                self,
+                "Valve Job Running",
+                "A valve command is currently in progress.\n\n"
+                "Sending temperature commands during valve operation\n"
+                "may cause the GUI to freeze.\n\n"
+                "Continue anyway?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+            if reply == QMessageBox.StandardButton.No:
+                return
+        
         try:
             # Convert to int since Arduino expects int, not float
             tc2 = int(float(self.tc2_input.text()))
@@ -454,7 +515,10 @@ class ALDMainWindow(QMainWindow):
             tc5 = int(float(self.tc5_input.text()))
             
             await self.controller.temp(tc2, tc3, tc4, tc5)
-            self.log_text.append(f"Sent: t{tc2};{tc3};{tc4};{tc5}")
+            
+            cmd_str = f"t{tc2};{tc3};{tc4};{tc5}"
+            self.log_text.append(f"Sent: {cmd_str}")
+            self.log_command('TEMP', cmd_str, f'Targets: TC2={tc2}, TC3={tc3}, TC4={tc4}, TC5={tc5}')
             
         except ValidationError as e:
             QMessageBox.warning(self, "Validation Error", str(e))
@@ -468,6 +532,7 @@ class ALDMainWindow(QMainWindow):
         try:
             await self.controller.test()
             self.log_text.append("Sent: TEST")
+            self.log_command('TEST', 'TEST', 'Test communication')
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
     
@@ -476,6 +541,7 @@ class ALDMainWindow(QMainWindow):
         try:
             await self.controller.begin()
             self.log_text.append("Sent: BEGIN")
+            self.log_command('BEGIN', 'BEGIN', 'Start sequence')
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
     
@@ -524,7 +590,9 @@ class ALDMainWindow(QMainWindow):
         """Send reset command - clears pulse counter without locking"""
         try:
             await self.controller.reset()
+            self.valve_job_running = False
             self.log_text.append("Reset command sent - pulse counter cleared")
+            self.log_text.append(f"[DEBUG] Set valve_job_running = False (manual reset)")
             QMessageBox.information(
                 self,
                 "Reset Complete",
@@ -546,6 +614,86 @@ class ALDMainWindow(QMainWindow):
             if "Not Connected" in self.status_label.text():
                 self.status_label.setText(f"Connected to {self.port_input.text()}")
                 self.status_label.setStyleSheet("background-color: #27ae60; color: white; padding: 10px; font-weight: bold;")
+    
+    def log_command(self, log_type, command, details=''):
+        """Add command to history for later export"""
+        self.command_history.append({
+            'timestamp': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+            'type': log_type,
+            'command': command,
+            'details': details
+        })
+    
+    def export_command_log(self):
+        """Export command history to CSV file"""
+        if len(self.command_history) == 0:
+            QMessageBox.warning(self, "No Commands", "No commands have been sent yet.")
+            return
+        
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Command Log",
+            f"command_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            "CSV Files (*.csv)"
+        )
+        
+        if filename:
+            try:
+                with open(filename, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(['Timestamp', 'Type', 'Command', 'Details'])
+                    
+                    for entry in self.command_history:
+                        writer.writerow([
+                            entry['timestamp'],
+                            entry['type'],
+                            entry['command'],
+                            entry['details']
+                        ])
+                
+                QMessageBox.information(
+                    self,
+                    "Export Successful",
+                    f"Command log exported to:\n{filename}\n\n{len(self.command_history)} commands saved."
+                )
+            except Exception as e:
+                QMessageBox.critical(self, "Export Failed", f"Could not export log:\n{e}")
+    
+    def export_temperature_data(self):
+        """Export temperature data to CSV file"""
+        if len(self.temp_data['time']) == 0:
+            QMessageBox.warning(self, "No Data", "No temperature data to export yet.")
+            return
+        
+        filename, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Temperature Data",
+            f"temp_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            "CSV Files (*.csv)"
+        )
+        
+        if filename:
+            try:
+                with open(filename, 'w', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(['Sample', 'TC2 (°C)', 'TC3 (°C)', 'TC4 (°C)', 'TC5 (°C)'])
+                    
+                    for i in range(len(self.temp_data['time'])):
+                        writer.writerow([
+                            self.temp_data['time'][i],
+                            self.temp_data['tc2'][i],
+                            self.temp_data['tc3'][i],
+                            self.temp_data['tc4'][i],
+                            self.temp_data['tc5'][i]
+                        ])
+                
+                QMessageBox.information(
+                    self,
+                    "Export Successful",
+                    f"Temperature data exported to:\n{filename}\n\n{len(self.temp_data['time'])} samples saved."
+                )
+            except Exception as e:
+                QMessageBox.critical(self, "Export Failed", f"Could not export data:\n{e}")
 
 def main():
     app = QApplication(sys.argv)
