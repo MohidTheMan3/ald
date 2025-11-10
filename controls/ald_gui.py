@@ -70,6 +70,7 @@ class ALDMainWindow(QMainWindow):
                     self.temp_data['tc4'].append(float(temps[2]))
                     self.temp_data['tc5'].append(float(temps[3]))
                     self.temp_data['time'].append(self.time_counter)
+                    self.temp_data['timestamp'].append(datetime.now())  # Record actual time
                     self.time_counter += 1
             except (ValueError, IndexError) as e:
                 # Debug: print malformed messages
@@ -676,10 +677,11 @@ class ALDMainWindow(QMainWindow):
             try:
                 with open(filename, 'w', newline='') as f:
                     writer = csv.writer(f)
-                    writer.writerow(['Sample', 'TC2 (°C)', 'TC3 (°C)', 'TC4 (°C)', 'TC5 (°C)'])
+                    writer.writerow(['Timestamp', 'Sample', 'TC2 (°C)', 'TC3 (°C)', 'TC4 (°C)', 'TC5 (°C)'])
                     
                     for i in range(len(self.temp_data['time'])):
                         writer.writerow([
+                            self.temp_data['timestamp'][i].strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],  # Timestamp with milliseconds
                             self.temp_data['time'][i],
                             self.temp_data['tc2'][i],
                             self.temp_data['tc3'][i],
