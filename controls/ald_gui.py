@@ -677,17 +677,33 @@ class ALDMainWindow(QMainWindow):
             try:
                 with open(filename, 'w', newline='') as f:
                     writer = csv.writer(f)
-                    writer.writerow(['Timestamp', 'Sample', 'TC2 (°C)', 'TC3 (°C)', 'TC4 (°C)', 'TC5 (°C)'])
+                    
+                    # Check if we have timestamps
+                    has_timestamps = 'timestamp' in self.temp_data and len(self.temp_data['timestamp']) > 0
+                    
+                    if has_timestamps:
+                        writer.writerow(['Timestamp', 'Sample', 'TC2 (°C)', 'TC3 (°C)', 'TC4 (°C)', 'TC5 (°C)'])
+                    else:
+                        writer.writerow(['Sample', 'TC2 (°C)', 'TC3 (°C)', 'TC4 (°C)', 'TC5 (°C)'])
                     
                     for i in range(len(self.temp_data['time'])):
-                        writer.writerow([
-                            self.temp_data['timestamp'][i].strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],  # Timestamp with milliseconds
-                            self.temp_data['time'][i],
-                            self.temp_data['tc2'][i],
-                            self.temp_data['tc3'][i],
-                            self.temp_data['tc4'][i],
-                            self.temp_data['tc5'][i]
-                        ])
+                        if has_timestamps:
+                            writer.writerow([
+                                self.temp_data['timestamp'][i].strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
+                                self.temp_data['time'][i],
+                                self.temp_data['tc2'][i],
+                                self.temp_data['tc3'][i],
+                                self.temp_data['tc4'][i],
+                                self.temp_data['tc5'][i]
+                            ])
+                        else:
+                            writer.writerow([
+                                self.temp_data['time'][i],
+                                self.temp_data['tc2'][i],
+                                self.temp_data['tc3'][i],
+                                self.temp_data['tc4'][i],
+                                self.temp_data['tc5'][i]
+                            ])
                 
                 QMessageBox.information(
                     self,
