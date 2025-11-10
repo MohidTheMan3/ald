@@ -26,7 +26,8 @@ class ALDMainWindow(QMainWindow):
             'tc3': deque(maxlen=1000),
             'tc4': deque(maxlen=1000),
             'tc5': deque(maxlen=1000),
-            'time': deque(maxlen=1000)
+            'time': deque(maxlen=1000),
+            'timestamp': deque(maxlen=1000)
         }
         self.time_counter = 0
         self.valve_job_running = False  # Track if valve job is active
