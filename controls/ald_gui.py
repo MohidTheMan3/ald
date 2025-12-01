@@ -23,11 +23,12 @@ class ALDMainWindow(QMainWindow):
         
         # Temperature data storage
         self.temp_data = {
-            'tc2': deque(maxlen=1000),  # Increased from 100 to keep more history
-            'tc3': deque(maxlen=1000),
-            'tc4': deque(maxlen=1000),
-            'tc5': deque(maxlen=1000),
-            'time': deque(maxlen=1000)
+            'tc2': deque(maxlen=10000),  # Increased from 100 to keep more history
+            'tc3': deque(maxlen=10000),
+            'tc4': deque(maxlen=10000),
+            'tc5': deque(maxlen=10000),
+            'time': deque(maxlen=10000),
+            'timestamp': deque(maxlen=10000)
         }
         self.time_counter = 0
         self.valve_job_running = False  # Track if valve job is active
