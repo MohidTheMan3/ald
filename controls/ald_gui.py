@@ -14,6 +14,7 @@ from pydantic import ValidationError
 
 from ald_controller import ALDController
 from ald_models import ValveCommand, TempCommand
+from ald_recipe import Recipe
 
 class ALDMainWindow(QMainWindow):
     def __init__(self):
@@ -26,14 +27,17 @@ class ALDMainWindow(QMainWindow):
             'tc3': deque(maxlen=1000),
             'tc4': deque(maxlen=1000),
             'tc5': deque(maxlen=1000),
-            'time': deque(maxlen=1000),
-            'timestamp': deque(maxlen=1000)
+            'time': deque(maxlen=1000)
         }
         self.time_counter = 0
         self.valve_job_running = False  # Track if valve job is active
         
         # Command history for optional CSV export
         self.command_history = []
+        
+        # Recipe management
+        self.current_recipe = None
+        self.recipe_running = False
         
         self.setup_ui()
         
@@ -161,6 +165,7 @@ class ALDMainWindow(QMainWindow):
         
         self.setup_control_tab()
         self.setup_monitor_tab()
+        self.setup_recipe_tab()
         self.setup_log_tab()
         
         # Log at bottom
@@ -300,6 +305,107 @@ class ALDMainWindow(QMainWindow):
         layout.addWidget(self.chart_view)
         
         self.tabs.addTab(widget, "Temperature Monitor")
+    
+    def setup_recipe_tab(self):
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        
+        # Recipe builder section
+        builder_group = QGroupBox("Recipe Builder")
+        builder_layout = QVBoxLayout()
+        
+        # Recipe name
+        name_layout = QHBoxLayout()
+        name_layout.addWidget(QLabel("Recipe Name:"))
+        self.recipe_name_input = QLineEdit()
+        self.recipe_name_input.setPlaceholderText("e.g., Al2O3_50cycles")
+        name_layout.addWidget(self.recipe_name_input)
+        builder_layout.addLayout(name_layout)
+        
+        # Recipe description
+        desc_layout = QHBoxLayout()
+        desc_layout.addWidget(QLabel("Description:"))
+        self.recipe_desc_input = QLineEdit()
+        self.recipe_desc_input.setPlaceholderText("Optional description")
+        desc_layout.addWidget(self.recipe_desc_input)
+        builder_layout.addLayout(desc_layout)
+        
+        # Buttons for adding steps
+        step_buttons = QHBoxLayout()
+        
+        add_valve_btn = QPushButton("Add Current Valve Settings")
+        add_valve_btn.clicked.connect(self.add_valve_to_recipe)
+        step_buttons.addWidget(add_valve_btn)
+        
+        add_temp_btn = QPushButton("Add Current Temp Settings")
+        add_temp_btn.clicked.connect(self.add_temp_to_recipe)
+        step_buttons.addWidget(add_temp_btn)
+        
+        add_wait_btn = QPushButton("Add Wait Step")
+        add_wait_btn.clicked.connect(self.add_wait_to_recipe)
+        step_buttons.addWidget(add_wait_btn)
+        
+        builder_layout.addLayout(step_buttons)
+        
+        # Recipe preview
+        builder_layout.addWidget(QLabel("Recipe Steps:"))
+        self.recipe_preview = QTextEdit()
+        self.recipe_preview.setReadOnly(True)
+        self.recipe_preview.setMaximumHeight(150)
+        builder_layout.addWidget(self.recipe_preview)
+        
+        # Save/Clear buttons
+        save_buttons = QHBoxLayout()
+        
+        save_recipe_btn = QPushButton("Save Recipe")
+        save_recipe_btn.clicked.connect(self.save_recipe)
+        save_buttons.addWidget(save_recipe_btn)
+        
+        clear_recipe_btn = QPushButton("Clear Recipe")
+        clear_recipe_btn.clicked.connect(self.clear_recipe)
+        save_buttons.addWidget(clear_recipe_btn)
+        
+        save_buttons.addStretch()
+        builder_layout.addLayout(save_buttons)
+        
+        builder_group.setLayout(builder_layout)
+        layout.addWidget(builder_group)
+        
+        # Recipe execution section
+        exec_group = QGroupBox("Run Recipe")
+        exec_layout = QVBoxLayout()
+        
+        # Recipe selector
+        select_layout = QHBoxLayout()
+        select_layout.addWidget(QLabel("Select Recipe:"))
+        self.recipe_selector = QLineEdit()
+        self.recipe_selector.setReadOnly(True)
+        self.recipe_selector.setPlaceholderText("Click 'Load Recipe' to choose")
+        select_layout.addWidget(self.recipe_selector)
+        
+        load_btn = QPushButton("Load Recipe")
+        load_btn.clicked.connect(self.load_recipe)
+        select_layout.addWidget(load_btn)
+        exec_layout.addLayout(select_layout)
+        
+        # Recipe info display
+        self.recipe_info = QTextEdit()
+        self.recipe_info.setReadOnly(True)
+        self.recipe_info.setMaximumHeight(120)
+        exec_layout.addWidget(self.recipe_info)
+        
+        # Run button
+        self.run_recipe_btn = QPushButton("Run Recipe")
+        self.run_recipe_btn.clicked.connect(self.run_recipe)
+        self.run_recipe_btn.setStyleSheet("background-color: #3498db; color: white; font-weight: bold; padding: 10px;")
+        self.run_recipe_btn.setEnabled(False)
+        exec_layout.addWidget(self.run_recipe_btn)
+        
+        exec_group.setLayout(exec_layout)
+        layout.addWidget(exec_group)
+        
+        layout.addStretch()
+        self.tabs.addTab(widget, "Recipes")
     
     def setup_temperature_chart(self):
         """Setup the temperature monitoring chart"""
@@ -713,6 +819,199 @@ class ALDMainWindow(QMainWindow):
                 )
             except Exception as e:
                 QMessageBox.critical(self, "Export Failed", f"Could not export data:\n{e}")
+    
+    def add_valve_to_recipe(self):
+        """Add current valve settings to recipe"""
+        if self.current_recipe is None:
+            self.current_recipe = Recipe(
+                self.recipe_name_input.text() or "Unnamed Recipe",
+                self.recipe_desc_input.text()
+            )
+        
+        try:
+            valve_id = int(self.valve_id_input.text())
+            num_pulses = int(self.num_pulses_input.text())
+            pulse_time = int(self.pulse_time_input.text())
+            purge_time = int(self.purge_time_input.text())
+            
+            self.current_recipe.add_valve_step(valve_id, num_pulses, pulse_time, purge_time)
+            self.update_recipe_preview()
+        except ValueError:
+            QMessageBox.warning(self, "Input Error", "Please enter valid valve parameters")
+    
+    def add_temp_to_recipe(self):
+        """Add current temperature settings to recipe"""
+        if self.current_recipe is None:
+            self.current_recipe = Recipe(
+                self.recipe_name_input.text() or "Unnamed Recipe",
+                self.recipe_desc_input.text()
+            )
+        
+        try:
+            tc2 = int(float(self.tc2_input.text()))
+            tc3 = int(float(self.tc3_input.text()))
+            tc4 = int(float(self.tc4_input.text()))
+            tc5 = int(float(self.tc5_input.text()))
+            
+            self.current_recipe.add_temp_step(tc2, tc3, tc4, tc5)
+            self.update_recipe_preview()
+        except ValueError:
+            QMessageBox.warning(self, "Input Error", "Please enter valid temperature parameters")
+    
+    def add_wait_to_recipe(self):
+        """Add wait step to recipe"""
+        if self.current_recipe is None:
+            self.current_recipe = Recipe(
+                self.recipe_name_input.text() or "Unnamed Recipe",
+                self.recipe_desc_input.text()
+            )
+        
+        duration, ok = QInputDialog.getInt(
+            self,
+            "Wait Duration",
+            "Enter wait time (seconds):",
+            60, 1, 3600, 1
+        )
+        
+        if ok:
+            self.current_recipe.add_wait_step(duration)
+            self.update_recipe_preview()
+    
+    def update_recipe_preview(self):
+        """Update the recipe preview text"""
+        if self.current_recipe:
+            self.recipe_preview.setText(self.current_recipe.get_summary())
+    
+    def save_recipe(self):
+        """Save current recipe to file"""
+        if self.current_recipe is None or len(self.current_recipe.steps) == 0:
+            QMessageBox.warning(self, "No Recipe", "No recipe to save. Add some steps first.")
+            return
+        
+        if not self.recipe_name_input.text():
+            QMessageBox.warning(self, "No Name", "Please enter a recipe name.")
+            return
+        
+        # Update recipe name/desc from inputs
+        self.current_recipe.name = self.recipe_name_input.text()
+        self.current_recipe.description = self.recipe_desc_input.text()
+        
+        try:
+            self.current_recipe.save()
+            QMessageBox.information(
+                self,
+                "Recipe Saved",
+                f"Recipe '{self.current_recipe.name}' saved successfully!"
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Save Failed", f"Could not save recipe:\n{e}")
+    
+    def clear_recipe(self):
+        """Clear current recipe"""
+        self.current_recipe = None
+        self.recipe_preview.clear()
+        self.recipe_name_input.clear()
+        self.recipe_desc_input.clear()
+    
+    def load_recipe(self):
+        """Load a recipe from file"""
+        from PyQt6.QtWidgets import QInputDialog
+        
+        recipes = Recipe.list_recipes()
+        if not recipes:
+            QMessageBox.information(self, "No Recipes", "No saved recipes found.\n\nCreate and save a recipe first!")
+            return
+        
+        recipe_name, ok = QInputDialog.getItem(
+            self,
+            "Load Recipe",
+            "Select a recipe:",
+            recipes,
+            0,
+            False
+        )
+        
+        if ok and recipe_name:
+            try:
+                self.current_recipe = Recipe.load(f"recipes/{recipe_name}.json")
+                self.recipe_selector.setText(recipe_name)
+                self.recipe_info.setText(self.current_recipe.get_summary())
+                self.run_recipe_btn.setEnabled(True)
+            except Exception as e:
+                QMessageBox.critical(self, "Load Failed", f"Could not load recipe:\n{e}")
+    
+    @asyncSlot()
+    async def run_recipe(self):
+        """Execute the loaded recipe"""
+        if self.current_recipe is None:
+            QMessageBox.warning(self, "No Recipe", "Please load a recipe first.")
+            return
+        
+        if self.recipe_running:
+            QMessageBox.warning(self, "Recipe Running", "A recipe is already running.")
+            return
+        
+        reply = QMessageBox.question(
+            self,
+            "Run Recipe",
+            f"Run recipe '{self.current_recipe.name}'?\n\n"
+            f"This will execute {len(self.current_recipe.steps)} steps.\n"
+            f"You can use Emergency Stop if needed.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        
+        self.recipe_running = True
+        self.run_recipe_btn.setEnabled(False)
+        
+        try:
+            for i, step in enumerate(self.current_recipe.steps, 1):
+                self.log_text.append(f"[RECIPE] Step {i}/{len(self.current_recipe.steps)}")
+                
+                if step['type'] == 'valve':
+                    self.log_text.append(f"[RECIPE] Executing valve command...")
+                    await self.controller.valve(
+                        step['valve_id'],
+                        step['num_pulses'],
+                        step['pulse_time'],
+                        step['purge_time']
+                    )
+                    self.valve_job_running = True
+                    
+                    # Wait for valve job to complete
+                    timeout = 0
+                    while self.valve_job_running and timeout < 600:  # 10 min timeout
+                        await asyncio.sleep(1)
+                        timeout += 1
+                    
+                    if timeout >= 600:
+                        raise Exception("Valve command timed out")
+                
+                elif step['type'] == 'temp':
+                    self.log_text.append(f"[RECIPE] Setting temperatures...")
+                    await self.controller.temp(
+                        step['tc2'],
+                        step['tc3'],
+                        step['tc4'],
+                        step['tc5']
+                    )
+                
+                elif step['type'] == 'wait':
+                    self.log_text.append(f"[RECIPE] Waiting {step['duration']} seconds...")
+                    await asyncio.sleep(step['duration'])
+            
+            self.log_text.append(f"[RECIPE] Recipe '{self.current_recipe.name}' completed successfully!")
+            QMessageBox.information(self, "Recipe Complete", "Recipe executed successfully!")
+            
+        except Exception as e:
+            self.log_text.append(f"[RECIPE] Error: {e}")
+            QMessageBox.critical(self, "Recipe Failed", f"Recipe execution failed:\n{e}")
+        
+        finally:
+            self.recipe_running = False
+            self.run_recipe_btn.setEnabled(True)
 
 def main():
     app = QApplication(sys.argv)
