@@ -5,7 +5,8 @@ from datetime import datetime
 from collections import deque
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QLabel, QLineEdit, QPushButton, 
-                            QTextEdit, QTabWidget, QGroupBox, QMessageBox, QFileDialog)
+                            QTextEdit, QTabWidget, QGroupBox, QMessageBox, QFileDialog,
+                            QInputDialog)
 from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtGui import QColor, QPalette
 from PyQt6.QtCharts import QChart, QChartView, QLineSeries, QValueAxis
@@ -30,6 +31,18 @@ class ALDMainWindow(QMainWindow):
             'time': deque(maxlen=10000),
             'timestamp': deque(maxlen=10000)
         }
+        # Pressure and flow data storage
+        self.pressure_data = {
+            'value': deque(maxlen=10000),
+            'unit': deque(maxlen=10000),  # 'Torr' or 'mTorr'
+            'time': deque(maxlen=10000),
+            'timestamp': deque(maxlen=10000)
+        }
+        self.flow_data = {
+            'value': deque(maxlen=10000),
+            'time': deque(maxlen=10000),
+            'timestamp': deque(maxlen=10000)
+        }
         self.time_counter = 0
         self.valve_job_running = False  # Track if valve job is active
         
@@ -46,6 +59,8 @@ class ALDMainWindow(QMainWindow):
         def handle_response(msg):
             self.log_text.append(f"[ARDUINO] {msg}")
             self.parse_temperature_data(msg)
+            self.parse_pressure_data(msg)
+            self.parse_flow_data(msg)
             self.handle_arduino_status(msg)
         
         self.controller.set_callback(handle_response)
@@ -82,7 +97,35 @@ class ALDMainWindow(QMainWindow):
                 # Debug: print malformed messages
                 # print(f"Failed to parse temp: {msg} - {e}")
                 pass  # Ignore malformed messages
-    
+    def parse_pressure_data(self, msg):
+        """Parse pressure data from Arduino messages"""
+        # Arduino sends: "P: 123.45 mTorr" or "P: 1.23 Torr"
+        if msg.upper().startswith('P:'):
+            try:
+                parts = msg[2:].strip().split()
+                if len(parts) >= 2:
+                    value = float(parts[0])
+                    unit = parts[1]
+                    self.pressure_data['value'].append(value)
+                    self.pressure_data['unit'].append(unit)
+                    self.pressure_data['time'].append(self.time_counter)
+                    self.pressure_data['timestamp'].append(datetime.now())
+            except (ValueError, IndexError):
+                pass
+
+    def parse_flow_data(self, msg):
+        """Parse flow data from Arduino messages"""
+        # Arduino sends: "F: 2.5 m/s"
+        if msg.upper().startswith('F:'):
+            try:
+                parts = msg[2:].strip().split()
+                if len(parts) >= 1:
+                    value = float(parts[0])
+                    self.flow_data['value'].append(value)
+                    self.flow_data['time'].append(self.time_counter)
+                    self.flow_data['timestamp'].append(datetime.now())
+            except (ValueError, IndexError):
+                pass
     def handle_arduino_status(self, msg):
         """Handle status messages from Arduino"""
         msg_lower = msg.lower()
@@ -290,6 +333,19 @@ class ALDMainWindow(QMainWindow):
         self.tc5_reading.setStyleSheet("font-size: 14px; padding: 5px;")
         readings_layout.addWidget(self.tc5_reading)
         
+        sensors_group = QGroupBox("Pressure & Flow")
+        sensors_layout = QHBoxLayout()
+
+        self.pressure_reading = QLabel("Pressure: -- mTorr")
+        self.pressure_reading.setStyleSheet("font-size: 14px; padding: 5px;")
+        sensors_layout.addWidget(self.pressure_reading)
+
+        self.flow_reading = QLabel("Flow: -- m/s")
+        self.flow_reading.setStyleSheet("font-size: 14px; padding: 5px;")
+        sensors_layout.addWidget(self.flow_reading)
+
+        sensors_group.setLayout(sensors_layout)
+        layout.addWidget(sensors_group)
         readings_group.setLayout(readings_layout)
         layout.addWidget(readings_group)
         
@@ -498,7 +554,12 @@ class ALDMainWindow(QMainWindow):
         if len(self.temp_data['time']) > 0:
             max_time = max(self.temp_data['time'])
             self.axis_x.setRange(0, max(max_time + 1, 100))  # At least 100 for initial view
-    
+        if len(self.pressure_data['value']) > 0:
+            unit = self.pressure_data['unit'][-1] if self.pressure_data['unit'] else 'mTorr'
+            self.pressure_reading.setText(f"Pressure: {self.pressure_data['value'][-1]:.2f} {unit}")
+
+        if len(self.flow_data['value']) > 0:
+            self.flow_reading.setText(f"Flow: {self.flow_data['value'][-1]:.2f} m/s")
     def setup_log_tab(self):
         widget = QWidget()
         layout = QVBoxLayout(widget)
@@ -916,7 +977,6 @@ class ALDMainWindow(QMainWindow):
     
     def load_recipe(self):
         """Load a recipe from file"""
-        from PyQt6.QtWidgets import QInputDialog
         
         recipes = Recipe.list_recipes()
         if not recipes:
