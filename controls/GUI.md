@@ -16,7 +16,7 @@ python ald_gui.py
 
 ### The Problem
 
-The original Tkinter-based GUI for our ALD system suffered from critical reliability issues that made it unsuitable for lab use:
+The original Tkinter-based GUI for our ALD system suffered from  reliability issues that made it unsuitable for safe use:
 
 - **Unpredictable crashes** - Threading implementation caused the GUI to freeze or crash during experiments
 - **Wrong values sent** - Manual string parsing occasionally sent corrupted commands to hardware
@@ -24,11 +24,11 @@ The original Tkinter-based GUI for our ALD system suffered from critical reliabi
 - **Poor error handling** - Crashes provided no useful debugging information
 - **Difficult to maintain** - Threading bugs were hard to reproduce and fix
 
-These issues meant users couldn't trust the software during expensive deposition runs, wasting time and materials.
+These issues meant users couldn't trust the software during deposition runs, wasting time and materials.
 
-### Our Solution
+### Solution
 
-This complete rewrite addresses all reliability issues while adding new capabilities:
+This rewrite addresses all reliability issues while adding new capabilities:
 
 - **Async architecture** - Replaces threading with asyncio for stable, non-blocking communication
 - **Input validation** - Pydantic models prevent invalid commands before they reach hardware
@@ -40,15 +40,44 @@ This complete rewrite addresses all reliability issues while adding new capabili
 
 ### Impact on Hacker Fab Workflow
 
+This software is the critical middle step in the Hacker Fab process:
+
 ```
 Recipe → ALD Deposition →  Characterization
         (This software)│    (Analysis)
 ```
 
-This software is the critical middle step that enables:
+ALD enables:
 - Thin film deposition for MEMS, sensors, and nanodevices
 - Controlled growth of Al₂O₃, TiO₂, ZnO, and other materials
 - Reproducible results through validated parameter control
+
+---
+
+## Display
+
+### Control Tab
+![Control Tab](docs/screenshots/control_tab.png)
+
+*Main control interface with valve commands (left) and temperature setpoints (right). Red status bar shows connection state. Green indicates connected. Emergency stop and reset buttons provide safety controls.*
+
+### Temperature Monitor
+![Temperature Monitor](docs/screenshots/temp_monitor.png)
+
+*Real-time monitoring dashboard showing:*
+- *Pressure gauge reading (mTorr)*
+- *Flow sensor reading (m/s)*
+- *Four thermocouple temperatures (TC2-TC5)*
+- *Live temperature graph with auto-scaling axes*
+- *CSV export functionality*
+
+### Recipe Builder
+![Recipe Builder](docs/screenshots/recipe_tab.png)
+
+*Recipe management system for automated depositions:*
+- *Build multi-step recipes with valve, temperature, and wait commands*
+- *Save/load recipes as JSON files*
+- *Execute recipes with progress tracking*
 
 ---
 
@@ -58,30 +87,126 @@ This software is the critical middle step that enables:
 
 - Modern PyQt6 GUI with professional, stable interface
 - Real-time temperature monitoring with live graphs of 4 thermocouples
+- Pressure gauge monitoring (CVM211GBL)
+- Flow sensor monitoring (D6F-W10A1)
 - Input validation to prevent equipment damage from invalid commands
 - Emergency stop for immediate system lockdown
 - Async serial communication for non-blocking, reliable Arduino control
+- Recipe system for automated multi-step depositions
+- CSV export for temperature data and command logs
 - Comprehensive logging of all operations for troubleshooting
 - Reset function for soft reset without full emergency stop
 
-### Interface Overview
+---
 
-**Main Control Interface:**
-```
-Status: Connected to COM3
-[Connect] [Disconnect] [ESTOP] [Reset]
-Valve Control   Temperature 
-Valve ID: [1]    TC2: [100] °C
-Pulses: [10]     TC3: [150] °C
-Pulse: [100]     TC4: [200] °C
-Purge: [4000]    TC5: [250] °C
-Send Command      Send Command
+## Functionality Assessment
+
+### Test Results
+```bash
+$ pytest -v
+========================= test session starts =========================
+test_models.py::TestValveCommand::test_valid_valve PASSED
+test_models.py::TestValveCommand::test_invalid_valve_id PASSED
+test_models.py::TestValveCommand::test_negative_pulses PASSED
+test_models.py::TestValveCommand::test_too_many_pulses PASSED
+test_models.py::TestValveCommand::test_pulse_time_too_short PASSED
+test_models.py::TestValveCommand::test_pulse_time_too_long PASSED
+test_models.py::TestValveCommand::test_negative_purge PASSED
+test_models.py::TestTempCommand::test_valid_temps PASSED
+test_models.py::TestTempCommand::test_negative_temp PASSED
+test_models.py::TestTempCommand::test_temp_too_high PASSED
+test_models.py::TestTempCommand::test_all_zeros PASSED
+test_models.py::TestJobConfig::test_valid_job PASSED
+test_models.py::TestJobConfig::test_empty_name PASSED
+test_models.py::TestJobConfig::test_whitespace_name PASSED
+test_controller.py::TestBasic::test_create_controller PASSED
+test_controller.py::TestBasic::test_logger_setup PASSED
+test_controller.py::TestWithArduino::test_connect SKIPPED (No Arduino)
+test_controller.py::TestWithArduino::test_bad_port PASSED
+test_controller.py::TestWithArduino::test_commands SKIPPED (No Arduino)
+test_controller.py::TestWithArduino::test_callback SKIPPED (No Arduino)
+=================== 17 passed, 3 skipped in 0.52s ====================
 ```
 
-**Temperature Monitoring:**
-- Real-time graph updates every 500ms
-- Auto-scaling axes
-- Color-coded lines for each sensor
+| Test Suite | Tests | Passed | Skipped | Coverage |
+|------------|-------|--------|---------|----------|
+| `TestValveCommand` | 7 | 7 | 0 | Valve input validation |
+| `TestTempCommand` | 4 | 4 | 0 | Temperature validation |
+| `TestJobConfig` | 3 | 3 | 0 | Job configuration |
+| `TestBasic` | 2 | 2 | 0 | Controller instantiation |
+| `TestWithArduino` | 4 | 1  | 3 | Hardware integration |
+| **Total** | **20** | **17** | **3** | **100% (excl. hardware)** |
+
+> **Note:** `TestWithArduino` tests require physical Arduino connection and are skipped in CI environments.
+
+### Feature Completion
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Async Serial Communication |  Complete | Replaced threading with asyncio |
+| Temperature Monitoring |  Complete | 4 thermocouples (TC2-TC5) |
+| Pressure Monitoring |  Complete | CVM211GBL gauge support |
+| Flow Monitoring |  Complete | D6F-W10A1 sensor support |
+| Valve Control |  Complete | 3 valves with pulse/purge timing |
+| Input Validation |  Complete | Pydantic models |
+| Emergency Stop |  Complete | Hardware lockout |
+| Soft Reset |  Complete | Clear pulse counter |
+| Recipe System |  Complete | Save/load/execute |
+| CSV Export |  Complete | Temp data + command history |
+
+### Validation Ranges
+
+| Parameter | Valid Range | Enforced By |
+|-----------|-------------|-------------|
+| Valve ID | 1-3 | Pydantic model |
+| Number of Pulses | 1-1000 | Pydantic model |
+| Pulse Time | 10-10000 ms | Pydantic model |
+| Purge Time | 0-15000 ms | Pydantic model |
+| Temperature | 0-500°C | Pydantic model |
+
+### Known Issues
+
+| Issue | Severity | Workaround |
+|-------|----------|------------|
+| Task conflict during recipe execution | Medium | Status timer skipped during recipes |
+| No recipe pause/resume | Low | Use emergency stop if needed |
+| Graph clears on reconnect | Low | Export data before disconnect |
+
+---
+
+## Design Decisions
+
+### Why Async Instead of Threading?
+
+The original Tkinter GUI used Python threading, which caused race conditions and crashes when multiple threads accessed the serial port simultaneously.
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| Threading | Familiar | Race conditions, GUI crashes |
+| Multiprocessing | True parallelism | Complex IPC, high overhead |
+| **Asyncio** | Single-threaded, no races | Learning curve |
+
+**Our solution:** `asyncio` + `qasync` provides single-threaded concurrency with non-blocking I/O, eliminating race conditions entirely.
+
+### Why Pydantic for Validation?
+
+| Approach | Pros | Cons |
+|----------|------|------|
+| Manual `if` checks | Simple | Easy to miss edge cases |
+| JSON Schema | Standard | Verbose, no Python integration |
+| **Pydantic** | Type hints, clear errors, fast | Extra dependency |
+
+Pydantic catches errors like `valve_id=5` or `pulse_time=-100` before they reach hardware, with clear error messages.
+
+### Why PyQt6 Over Tkinter?
+
+| Feature | Tkinter | PyQt6 |
+|---------|---------|-------|
+| Built-in Charts |  External libs |  PyQt6-Charts |
+| Async Support |  Poor |  Good (qasync) |
+| Styling | Limited | Full CSS-like QSS |
+| Threading Safety |  Crashes |  Stable |
+| Look & Feel | Dated | Modern, native |
 
 ---
 
@@ -95,7 +220,7 @@ Send Command      Send Command
 
 ### Step-by-Step Installation
 
-#### Method 1: Automatic (Recommended)
+#### Method 1: Direct Install
 
 **Windows:**
 ```batch
@@ -127,6 +252,8 @@ python -c "from ald_controller import ALDController; print('Installation success
 4. Click **Upload**
 5. Wait for "Done uploading"
 
+>  **Warning:** Do not flash old firmware, pin mappings have changed!
+
 ---
 
 ## Usage
@@ -134,7 +261,7 @@ python -c "from ald_controller import ALDController; print('Installation success
 ### Quick Start
 
 1. Connect Arduino to computer via USB
-2. Run GUI: Run `python ald_gui.py`
+2. Run GUI: `python ald_gui.py`
 3. Enter COM port (Usually COM3 on Windows, /dev/ttyUSB0 on Linux)
 4. Click Connect
 5. Use Control tab to send commands
@@ -152,15 +279,11 @@ python -c "from ald_controller import ALDController; print('Installation success
 
 #### Emergency Procedures
 
-**Normal Stop** (use this):
-- Click orange "Reset Valves" button
-- Clears current command
-- System remains operational
-
-**Emergency Stop** (Emergencies only):
-- Click red "EMERGENCY STOP" button
-- All valves close, heaters off
-- Arduino locks (requires restart)
+| Situation | Action | Result |
+|-----------|--------|--------|
+| Normal stop | Click **Reset Valves** (orange) | Clears command, system operational |
+| Emergency | Click **EMERGENCY STOP** (red) | All off, Arduino locks |
+| After E-Stop | Disconnect, restart Arduino, reconnect | System recovers |
 
 ### Command Reference
 
@@ -201,113 +324,64 @@ Parameters:
 
 ## System Architecture
 
-### Overview
-
-```
-┌───────────────────────────────────────────┐
-│            ALD Control System             │
- ─────────────────────────────────────────┤
-│                                           │
-│  ┌──────────────┐     ┌────────────────┐  │
-│  │  ald_gui.py  │────→│ald_controller  │  │
-│  │   (PyQt6)    │     │     .py        │  │
-│  │              │     │   (asyncio)    │  │
-│  └──────────────┘     └────────────────┘  │
-│         │                      │          │
-│         └──────────────────────┘          │
-│                    │                      │
-└────────────────────┼──────────────────────┘
-                     │ USB Serial
-          ┌──────────┼──────────┐
-          │    Arduino Uno      │
-          │  (Firmware v2.0)    │
-          └──────────┬──────────┘
-                     │
-     ┌───────────────┴────────────────┐
-     │                                │
-┌────┴────────┐              ┌────────┴────────┐
-│Thermocouples│              │  Relay Control  │
-│ (MAX31855)  │              │                 │
-│ - TC2-TC5   │              │ - Valves 1-3    │
-│             │              │ - Heaters 1-4   │
-└─────────────┘              └─────────────────┘
-```
-
 ### Component Responsibilities
 
-**ald_gui.py** (GUI Layer)
-- User interface and interaction
-- Input validation via Pydantic
-- Real-time data visualization
-- Error handling and user feedback
-
-**ald_controller.py** (Communication Layer)
-- Async serial communication
-- Command formatting
-- Response parsing
-- Connection management
-
-**ald_models.py** (Data Layer)
-- Pydantic validation models
-- Type safety
-- Range checking
-
-**Arduino Firmware** (Hardware Layer)
-- Thermocouple reading (MAX31855)
-- Relay control (MOSFETs + traditional)
-- Command parsing
-- Safety interlocks
+| File | Layer | Purpose |
+|------|-------|---------|
+| `ald_gui.py` | GUI | User interface, visualization, error handling |
+| `ald_controller.py` | Communication | Async serial, command formatting, response parsing |
+| `ald_models.py` | Data | Pydantic validation, type safety, range checking |
+| `ald_recipe.py` | Automation | Recipe save/load/execute |
+| `ald_manual_control.ino` | Hardware | Thermocouple reading, relay control, safety interlocks |
 
 ### Data Flow
 
-**Command Flow** (PC → Arduino):
+**Command Flow (PC → Arduino):**
 ```
-User Input → Pydantic Validation → Format Command → 
-Serial Write → Arduino Parse → Execute
+User Input → Pydantic Validation → Format Command → Serial Write → Arduino Parse → Execute
 ```
 
-**Response Flow** (Arduino → PC):
+**Response Flow (Arduino → PC):**
 ```
-Arduino Sensor → Serial Print → Async Read → 
-Parse Data → Update GUI
+Arduino Sensor → Serial Print → Async Read → Parse Data → Update GUI
 ```
 
 ---
 
 ## Tech Stack
 
-### Software Stack
+### Software Dependencies
 
-Main dependencies:
+| Package | Version | License | Purpose |
+|---------|---------|---------|---------|
+| PyQt6 | 6.6+ | GPL v3 | GUI framework |
+| PyQt6-Charts | 6.6+ | GPL v3 | Temperature graphs |
+| qasync | 0.24+ | BSD | Qt + asyncio bridge |
+| Pydantic | 2.5+ | MIT | Input validation |
+| pyserial-asyncio | 0.6+ | BSD | Async serial communication |
+| pytest | 7.4+ | MIT | Unit testing |
+| PyYAML | 6.0+ | MIT | Config files |
 
-PyQt6 (6.6+) - GUI framework for the interface
-PyQt6-Charts (6.6+) - Makes the temperature graphs
-qasync (0.24+) - Lets Qt and asyncio work together
-Pydantic (2.5+) - Validates inputs before sending to Arduino
-pyserial-asyncio (0.6+) - Talks to Arduino without blocking
-pytest (7.4+) - For running tests
-PyYAML (6.0+) - Config files (planned feature)
+### Hardware Components
 
-### Hardware Stack
-
-Arduino Uno (ATmega328P) - The main microcontroller
-MAX31855 chips (4x) - Read K-type thermocouples for temperature
-MOSFETs (Active HIGH) - Control pneumatic valves
-Relays (Active LOW) - Switch heaters on and off
+| Component | Model | Purpose |
+|-----------|-------|---------|
+| Microcontroller | Arduino Uno (ATmega328P) | Main controller |
+| Thermocouple Amplifier | MAX31855 (x4) | K-type temperature reading |
+| Pressure Gauge | Stinger CVM211GBL | Chamber pressure |
+| Flow Sensor | Omron D6F-W10A1 | Gas flow rate |
+| Valve Control | MOSFETs (Active HIGH) | Pneumatic valves |
+| Heater Control | Relays (Active LOW) | Heating elements |
 
 ### System Requirements
 
-**Minimum:**
-- OS: Windows 10, macOS 10.14, or Linux
-- Python: 3.9+
-- RAM: 512MB
-- Storage: 50MB
-- USB: 1 port
-
-**Recommended:**
-- Python 3.11+
-- RAM: 1GB
-- Display: 1280x720 or higher
+| Requirement | Minimum | Recommended |
+|-------------|---------|-------------|
+| OS | Windows 10 / macOS 10.14 / Linux | Latest |
+| Python | 3.9 | 3.11+ |
+| RAM | 512 MB | 1 GB |
+| Storage | 50 MB | 100 MB |
+| Display | 1024x768 | 1280x720+ |
 
 ---
 
@@ -316,17 +390,19 @@ Relays (Active LOW) - Switch heaters on and off
 ### Project Structure
 
 ```
-controls
-  ald_gui.py              # Main GUI application
-  ald_controller.py       # Serial communication
-  ald_models.py           # Data validation models
-  test_controller.py      # Unit tests
-  test_models.py          # Validation tests
-  demo_controller.py      # Interactive demo
-  requirements.txt        # Python dependencies
-  README.md               # This file
-  DEVELOPMENT_LOG.md      # Development history
-  ARCHITECTURE.md         # Technical design docs
+controls/
+├── ald_gui.py              # Main GUI application
+├── ald_controller.py       # Serial communication
+├── ald_models.py           # Data validation models
+├── ald_recipe.py           # Recipe management
+├── ald_manual_control.ino  # Arduino firmware
+├── test_controller.py      # Unit tests
+├── test_models.py          # Validation tests
+├── demo_controller.py      # Interactive demo
+├── requirements.txt        # Python dependencies
+├── README.md               # This file
+└── recipes/                # Saved recipe files
+    └── *.json
 ```
 
 ### Running Tests
@@ -336,111 +412,72 @@ controls
 pytest -v
 
 # Run specific test suite
-pytest test_controller.py::TestBasic -v
+pytest test_controller.py -v
 pytest test_models.py -v
-
 ```
-
-### My Git Workflow
-
-To keep commits organized:
-- Made a new branch for big features
-- Committed whenever something worked
-- Wrote clear commit messages ("Add temperature validation")
-- Merged to main after testing
 
 ---
 
 ## Troubleshooting
 
-### Can't Connect to Arduino
+### Common Issues
 
-Try these in order:
-1. Make sure Arduino is plugged in (power LED should be on)
-2. Check the COM port:
-   - Windows: Device Manager → Ports
-   - Linux: `ls /dev/ttyUSB*`
-   - Mac: `ls /dev/tty.usb*`
-3. Close Arduino IDE (it might be using the port)
-4. Try a different USB cable or port
-5. Press the reset button on Arduino
+| Problem | Solution |
+|---------|----------|
+| Can't connect to Arduino | Check COM port in Device Manager, close Arduino IDE |
+| "Command Ignored" error | Wait for completion or click Reset Valves |
+| Temperature graph not updating | Check thermocouple wiring, verify Arduino Serial Monitor |
+| GUI crashes on startup | Verify Python 3.9+, reinstall dependencies |
+| Validation error | Check input ranges (see Validation Ranges table) |
 
-### "Command Ignored" Error
+### Debug Mode
 
-This means the previous command is still running.
-
-**Fix:** Wait for "Previous command has completed" or click the orange "Reset Valves" button
-
-### Temperature Graph Not Updating
-
-**Possible reasons:**
-- Thermocouples not plugged in → Check wiring
-- Wrong thermocouple type → Use K-type
-- Arduino not sending data → Check Serial Monitor
-- Parsing error → Look in `ald_controller.log`
-
-### GUI Crashes
-
-1. Restart the GUI
-2. Check `ald_controller.log` for errors
-3. Make sure you have Python 3.9+
-4. Reinstall: `pip install --upgrade -r requirements.txt`
-
-### "Validation Error"
-
-Your input is outside the valid range:
-- Valve ID: 1, 2, or 3
-- Pulse time: 10-10000 ms
-- Purge time: 0-15000 ms
-- Temperature: 0-500°C (integers only)
-
-### Need More Help?
-
-1. Check the log file: `ald_controller.log`
-2. Run tests: `pytest -v`
-3. Open a GitHub issue with your error message and log file
+Check the log file for detailed error information:
+```bash
+cat ald_controller.log
+```
 
 ---
 
 ## Future Improvements
 
-### Done
-- Async serial communication
-- PyQt6 GUI with tabs
-- Real-time temperature graphs
-- Input validation
-- Emergency stop
-- Logging
+### Completed
+-  Async serial communication
+-  PyQt6 GUI with tabs
+-  Real-time temperature graphs
+-  Pressure and flow monitoring
+-  Input validation
+-  Emergency stop
+-  Recipe system
+-  CSV export
+-  Logging
 
-### Working On Now
-- Recipe management (save/load common settings)
-- Export data to CSV
-- Configuration files
-- Run multiple depositions automatically
-
-### Ideas for Later
+### Planned
+- Recipe pause/resume functionality
+- Configuration files (YAML)
 - Historical data analysis
-- Batch processing
 - Web interface for remote monitoring
-- Better safety features
+
+---
+
+## License
+
+This project is licensed under the **MIT License**.
+
+This project uses PyQt6 which is licensed under GPL v3. As required by the GPL, this software is also available under open-source terms, which aligns with Hacker Fab's mission to create open-source, replicable work.
 
 ---
 
 ## Contact
 
-**Author:** Mohid Rattu
-**Email:** hackerfab@cmu.edu  
-**GitHub:** [github.com/MohidTheMan3/ald](https://github.com/MohidTheMan3/ald/tree/gui-revamp)
+**Author:** Mohid Rattu  
+**Email:** mrattu@andrew.cmu.edu  
+**GitHub:** [github.com/hacker-fab/ald](https://github.com/hacker-fab/ald)
 
-**Thanks to:**
+**Acknowledgments:**
 - CMU Hacker Fab team
+- Joel Gonzalez, Jay Kunselman, Atharva Raut (Arduino firmware)
 - 18-610 instructors
-- Everyone who helped test
-
-**Helpful Links:**
-- [What is ALD?](https://en.wikipedia.org/wiki/Atomic_layer_deposition)
-- [MAX31855 Datasheet](https://www.analog.com/en/products/max31855.html)
-- [PyQt6 Docs](https://www.riverbankcomputing.com/static/Docs/PyQt6/)
 
 ---
 
