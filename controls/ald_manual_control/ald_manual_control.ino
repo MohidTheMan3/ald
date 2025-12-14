@@ -5,7 +5,19 @@
 
 // CMU Hacker Fab 2025
 // Joel Gonzalez, Haewon Uhm, Atharva Raut
+// Updated 2025-Dec-05
+// Atharva: Pressure gauge reading verified in old GUI (also calibrated, only difference in 3rd significant digit being +-1)
+// Atharva: Flow sensor reading verified in old GUI (close to max value with door closed, goes to )
+// DO NOT flash old code since pin mappings have changed!!
 
+// PIN ALLOCATION
+// 0-1    Reserved (RX,TX)
+// 2      RELAY1 (Substrate heater)
+// 3-10   Thermocouples
+// 11     RELAY2 (Delivery line tape)
+// A0     Pressure Gauge
+// A1-A2  Precursor tapes --> TODO: 12-13 and repurpose A1 for flow sensor
+// A3-A5  Valves
 // toggle this if you want the system to do nothing
 #define DO_NOTHING 0
 // relay pins to control relays for heating elements
@@ -14,8 +26,8 @@
 // relay 3 -> precursor 1
 // relay 4 -> precursor 2
 #define RELAY1_PIN 2
-#define RELAY2_PIN A0
-#define RELAY3_PIN A1
+#define RELAY2_PIN 11      // changed from A0 to use that as an analog read pin for pressure gauge
+#define RELAY3_PIN 12
 #define RELAY4_PIN A2
 // relay pins to control relays for ALD valves
 // relay 6 -> valve 1
@@ -24,10 +36,24 @@
 #define RELAY6_PIN A3
 #define RELAY7_PIN A4
 #define RELAY8_PIN A5
+// Stinger CVM211GBL pressure gauge analog read
+// Analog read pin (rewired from previous relay2_pin)
+#define PGAUGE_PIN A0               // Wire to DB5 pin on CVM211GBL
+#define ADC_REF_V 5.0               // Arduino Uno default ADC reference
+#define CVM211_DIVIDER_RATIO 1.622    // (Rtop+Rbottom)/Rbottom of resistive divider; 1.622 for ideal 5.1:8.2 divider (max voltage at pin=5V)
+// ratio calibrated for better representation of actual resistor values
+#define FLOW_SENSE_PIN A1               // From flow sensor; ensure 5V voltage regulator or divide 5.7V-->5V for safety
+#define D6FW_DIVIDER_RATIO 2    // 1 if using 5V regulator, ~1.14 if dividing 5.7V-->5V
+const double D6FW04A1_LUT[5] = {1.00,1.58,2.88,4.11,5.00};   // from datasheet; corresponds to flow rate 0-4 m/s in increments of 1 m/s
+// we will use linear extrapolation based on the LUT reading for non-linear output readings
+
 
 #include <Adafruit_MAX31855.h>
 
 int32_t rawData = 0;
+
+const int num_samples_pgauge = 200;
+const int num_samples_flow_sense = 100;
 
 const int num_samples = 10;
 double tc1_readings[num_samples];
@@ -68,6 +94,9 @@ unsigned int num_pulse = 0; // positive integer value
 unsigned int pulse_time = 0; // ms
 unsigned int purge_time = 0; // ms
 
+bool busy = false;
+bool busy_prev = false;
+
 void setup()
 {
   if (DO_NOTHING)
@@ -91,6 +120,10 @@ void setup()
   digitalWrite(RELAY6_PIN, LOW);
   digitalWrite(RELAY7_PIN, LOW);
   digitalWrite(RELAY8_PIN, LOW);  // Active HIGH MOSFET
+
+  // pressure gauge (analog input: 1-8 V, scaled down to 5V range)
+  pinMode(PGAUGE_PIN, INPUT);  
+  pinMode(FLOW_SENSE_PIN, INPUT);  
 
   // K-type: pins 3,4,5,6
   // J-type: pins 7,8,9,10
@@ -233,8 +266,71 @@ void precursorValveActuation()
   }
 }
 
+// Pressure Gauge Functions (specifically for Stinger CVM211GBL)
+// Read raw analog and return reconstructed gauge pin voltage
+static double cvm211_readGaugeVolts() {
+  uint32_t acc = 0;
+  for (int i = 0; i < num_samples_pgauge; ++i) acc += analogRead(PGAUGE_PIN);
+  double adcCounts = acc / (double)num_samples_pgauge;
+  double vadc = (adcCounts * ADC_REF_V) / 1023.0;   // 10-bit ADC
+  double vgauge = vadc * CVM211_DIVIDER_RATIO;      // compensate for resistive divider
+  return vgauge;
+}
+
+// Convert gauge voltage (log-linear model, CVM211GBL) to pressure (Torr): P = 10^(V - 5)
+static double cvm211_logLinear_toTorr(double v) {
+  if (v < 1.0) v = 1.0;            // clamp to CVM211GBL range
+  if (v > 8.0) v = 8.0;
+  return pow(10.0, v - 5.0);
+}
+
+// Public helper: read pressure in Torr (log-linear only)
+void readCVM211PressureTorr() {
+  double v = cvm211_readGaugeVolts();
+  double P_Torr = cvm211_logLinear_toTorr(v);
+  double P_mTorr = 1000*P_Torr;
+  if (P_Torr > 100) Serial.println("P: " + String(P_Torr) + " Torr");
+  else Serial.println("P: " + String(P_mTorr) + " mTorr");
+}
+// END pressure gauge functions
+
+// Flow Sensor Functions (specifically for MEMS Flow Sensor D6F-W10A1)
+// Read raw analog and return reconstructed pin voltage
+static double d6fw_readGaugeVolts() {
+  uint32_t acc = 0;
+  for (int i = 0; i < num_samples_flow_sense; ++i) acc += analogRead(FLOW_SENSE_PIN);
+  double adcCounts = acc / (double)num_samples_flow_sense;
+  double vadc = (adcCounts * ADC_REF_V) / 1023.0;   // 10-bit ADC
+  double vgauge = vadc * D6FW_DIVIDER_RATIO;      // compensate for resistive divider if any
+  return vgauge;
+}
+
+// Convert flow sensor voltage (log-linear model, CVM211GBL) to pressure (Torr): P = 10^(V - 5)
+static double d6fw_nonLinear_to_mps(double v) {
+  double flow_rate_extrapolated;
+  int low = 0;
+  int high = 4;
+  for (int i=0; i<=4; ++i){
+    if (D6FW04A1_LUT[i] <= v) low = i;
+    if (D6FW04A1_LUT[4-i] > v) high = (4-i);
+  }
+  if (D6FW04A1_LUT[high]==D6FW04A1_LUT[low]) flow_rate_extrapolated = 0;    // error?
+  else flow_rate_extrapolated = ((v-D6FW04A1_LUT[low])*high + (D6FW04A1_LUT[high]-v)*low)/(D6FW04A1_LUT[high]-D6FW04A1_LUT[low]);    //linear extrapolation
+  return flow_rate_extrapolated;
+}
+
+// Public helper: read flow rate in m/s (non-linear read relationship based on datasheet LUT)
+void readD6FWFlow() {
+  double v = d6fw_readGaugeVolts();
+  double flow_rate = d6fw_nonLinear_to_mps(v);
+  Serial.println("F: " + String(flow_rate) + " m/s");
+}
+// END flow sensor functions
+
 void loop()
 { 
+  busy_prev = busy;
+
   // command parsing code
   if ((Serial.available() > 0))
   {
@@ -245,8 +341,8 @@ void loop()
     
     // s = "s";              // STOP command: exit loop 
     // s = "r";              // RESET command: reset pulse counter 
-    // s = "t;100;200;150;90";  // example temp. command
-    // s = "v;2;5;1000;3000";   // example valve command
+    // s = "t100;200;150;90";  // example temp. command
+    // s = "v2;5;1000;3000";   // example valve command
 
     Serial.println(s);
     int result = 0;
@@ -282,11 +378,10 @@ void loop()
         result = sscanf(s, "t%d;%d;%d;%d", &temp_sp2, &temp_sp3, &temp_sp4, &temp_sp5);
       } else if (s[0] == 'v') // ALD valve command
       {
-        if (num_pulse != 0)
+        if (busy) Serial.println("COMMAND IGNORED. Wait for previous command to finish, or issue RESET.");
+        else
         {
-          Serial.println("COMMAND IGNORED. Wait for previous command to finish, or issue RESET.")
-        } else
-        {
+          busy = true;
           result = sscanf(s, "v%u;%u;%u;%u", &which_valve, &num_pulse, &pulse_time, &purge_time);    
         }
       } else
@@ -312,7 +407,8 @@ void loop()
   precursorValveActuation();
   if (num_pulse == 0)
   {
-    Serial.println("Previous command has completed. Ready for new command.")
+    busy = false;
+    if(busy_prev) Serial.println("Previous command has completed. Ready for new command.");
   }
   // need to ensure that python doesn't send new command till acknowledgement is received
   // TODO: @Modid, suggest best method to convey it back to python
@@ -321,4 +417,10 @@ void loop()
   // heating control loop
   readThermocouples();
   actuateHeatingElements();
+
+  // read pressure gauge and send to python
+  readCVM211PressureTorr();
+
+  // read flow sensor and send to python
+  readD6FWFlow();
 }
