@@ -80,14 +80,16 @@ double tc8_avg = 0.0;
 double current_reading[8];
 
 // pins 3-10
+// K-type: index 0,1,2,3 (pins 3,4,5,6) -> tc5, tc2, tc3, tc4
+// J-type: index 4,5,6,7 (pins 7,8,9,10)
 Adafruit_MAX31855 thermocouples[8] = {Adafruit_MAX31855(3), Adafruit_MAX31855(4), Adafruit_MAX31855(5), Adafruit_MAX31855(6), Adafruit_MAX31855(7), Adafruit_MAX31855(8), Adafruit_MAX31855(9), Adafruit_MAX31855(10)};
 
 // set temperature setpoint for heating elements
 int tc_active = 0;
-int temp_sp2 = 0; // delivery line
-int temp_sp3 = 0; // precursor 1
-int temp_sp4 = 0; // precursor 2
-int temp_sp5 = 0; // substrate heater
+int temp_sp2 = 0; // delivery line (K-type, pin 4)
+int temp_sp3 = 0; // precursor 1 (K-type, pin 5)
+int temp_sp4 = 0; // precursor 2 (K-type, pin 6)
+int temp_sp5 = 0; // substrate heater (K-type, pin 3 - FIRST K-TYPE PORT)
 
 unsigned int which_valve = 0; // 1, 2, or 3
 unsigned int num_pulse = 0; // positive integer value
@@ -151,7 +153,7 @@ void readThermocouples()
   tc2_readings[index] = current_reading[1];
   tc3_readings[index] = current_reading[2];
   tc4_readings[index] = current_reading[3];
-  tc5_readings[index] = current_reading[4];
+  tc5_readings[index] = current_reading[0];
   // tc6_readings[index] = current_reading[5];
   // tc7_readings[index] = current_reading[6];
   // tc8_readings[index] = current_reading[7];

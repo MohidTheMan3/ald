@@ -3,6 +3,7 @@ import asyncio
 import csv
 from datetime import datetime, timedelta
 from collections import deque
+import winsound
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QLabel, QLineEdit, QPushButton, 
                             QTextEdit, QTabWidget, QGroupBox, QMessageBox, QFileDialog,
@@ -55,6 +56,11 @@ class ALDMainWindow(QMainWindow):
         self.job_total_duration = 0
         self.job_timer = QTimer()
         self.job_timer.timeout.connect(self.update_job_progress)
+        
+        # Flow alarm state tracking
+        self.flow_alarm_threshold = 2.0  # m/s
+        self.flow_alarm_active = False
+        self.flow_alarm_dialog = None
         
         # Command history for optional CSV export
         self.command_history = []
@@ -791,7 +797,55 @@ class ALDMainWindow(QMainWindow):
             self.pressure_reading.setText(f"Pressure: {self.pressure_data['value'][-1]:.2f} {unit}")
         
         if len(self.flow_data['value']) > 0:
-            self.flow_reading.setText(f"Flow: {self.flow_data['value'][-1]:.2f} m/s")
+            self.flow_reading.setText(f"Precursor Gas Box Airflow: {self.flow_data['value'][-1]:.2f} m/s")
+            # Check flow alarm status
+            self.check_flow_alarm()
+    
+    def check_flow_alarm(self):
+        """Check flow sensor and trigger/dismiss non-latching alarm"""
+        if len(self.flow_data['value']) == 0:
+            return
+        
+        current_flow = self.flow_data['value'][-1]
+        
+        # Flow is below threshold - alarm should be active
+        if current_flow < self.flow_alarm_threshold:
+            if not self.flow_alarm_active:
+                self.flow_alarm_active = True
+                self.show_flow_alarm()
+        # Flow is above threshold - alarm should be dismissed
+        else:
+            if self.flow_alarm_active:
+                self.flow_alarm_active = False
+                self.dismiss_flow_alarm()
+    
+    def show_flow_alarm(self):
+        """Display non-latching flow alarm dialog with sound"""
+        if self.flow_alarm_dialog is None or not self.flow_alarm_dialog.isVisible():
+            self.flow_alarm_dialog = QMessageBox(self)
+            self.flow_alarm_dialog.setWindowTitle("⚠️ AIRFLOW ALARM")
+            self.flow_alarm_dialog.setText(
+                f"⚠️ AIRFLOW WARNING ⚠️\n\n"
+                f"Precursor Gas Box airflow has dropped below {self.flow_alarm_threshold} m/s!\n\n"
+                f"Current airflow: {self.flow_data['value'][-1]:.2f} m/s\n\n"
+                f"Please check ventilation system."
+            )
+            self.flow_alarm_dialog.setIcon(QMessageBox.Icon.Warning)
+            self.flow_alarm_dialog.setStandardButtons(QMessageBox.StandardButton.NoButton)
+            self.flow_alarm_dialog.show()
+            
+            # Play alarm sound
+            try:
+                winsound.Beep(1000, 500)  # 1000 Hz for 500ms
+            except Exception as e:
+                print(f"Could not play alarm sound: {e}")
+    
+    def dismiss_flow_alarm(self):
+        """Dismiss the flow alarm dialog"""
+        if self.flow_alarm_dialog is not None:
+            self.flow_alarm_dialog.close()
+            self.flow_alarm_dialog = None
+    
     
     def update_job_progress(self):
         """Update the job progress bar and time remaining"""
