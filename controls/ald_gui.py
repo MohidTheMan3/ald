@@ -831,7 +831,9 @@ class ALDMainWindow(QMainWindow):
                 f"Please check ventilation system."
             )
             self.flow_alarm_dialog.setIcon(QMessageBox.Icon.Warning)
-            self.flow_alarm_dialog.setStandardButtons(QMessageBox.StandardButton.NoButton)
+            # Add OK button so user can dismiss, but it will reappear if flow still low
+            self.flow_alarm_dialog.setStandardButtons(QMessageBox.StandardButton.Ok)
+            self.flow_alarm_dialog.setWindowModality(Qt.WindowModality.NonModal)  # Non-blocking
             self.flow_alarm_dialog.show()
             
             # Play alarm sound
@@ -839,14 +841,14 @@ class ALDMainWindow(QMainWindow):
                 winsound.Beep(1000, 500)  # 1000 Hz for 500ms
             except Exception as e:
                 print(f"Could not play alarm sound: {e}")
-    
+
     def dismiss_flow_alarm(self):
         """Dismiss the flow alarm dialog"""
         if self.flow_alarm_dialog is not None:
             self.flow_alarm_dialog.close()
             self.flow_alarm_dialog = None
-    
-    
+            self.flow_alarm_active = False  # Reset the flag too
+        
     def update_job_progress(self):
         """Update the job progress bar and time remaining"""
         if self.job_start_time is None or self.job_total_duration == 0:
