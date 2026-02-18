@@ -91,6 +91,20 @@ int temp_sp3 = 0; // precursor 1 (K-type, pin 5)
 int temp_sp4 = 0; // precursor 2 (K-type, pin 6)
 int temp_sp5 = 0; // substrate heater (K-type, pin 3 - FIRST K-TYPE PORT)
 
+// Hysteresis offsets for heating elements (in °C)
+// Turn ON when temp < setpoint - HYSTERESIS_OFFSET
+// Turn OFF when temp > setpoint + HYSTERESIS_OFFSET
+const int HYSTERESIS_TC2 = 5;  // delivery line tape
+const int HYSTERESIS_TC3 = 5;  // precursor 1
+const int HYSTERESIS_TC4 = 5;  // precursor 2
+const int HYSTERESIS_TC5 = 5;  // substrate heater
+
+// Track relay states for hysteresis logic
+bool relay2_on = false;
+bool relay3_on = false;
+bool relay4_on = false;
+bool relay1_on = false;
+
 unsigned int which_valve = 0; // 1, 2, or 3
 unsigned int num_pulse = 0; // positive integer value
 unsigned int pulse_time = 0; // ms
@@ -150,9 +164,9 @@ void readThermocouples()
   }
 
   // tc1_readings[index] = current_reading[0];
-  tc2_readings[index] = current_reading[1];
+  tc2_readings[index] = current_reading[3];
   tc3_readings[index] = current_reading[2];
-  tc4_readings[index] = current_reading[3];
+  tc4_readings[index] = current_reading[1];
   tc5_readings[index] = current_reading[0];
   // tc6_readings[index] = current_reading[5];
   // tc7_readings[index] = current_reading[6];
@@ -193,25 +207,53 @@ void actuateHeatingElements()
 {
   if (tc_active)
   {
-    if (tc2_avg > temp_sp2)
-      digitalWrite(RELAY2_PIN, HIGH);
-    else
-      digitalWrite(RELAY2_PIN, LOW);
+    // TC2 (delivery line tape) - hysteresis control
+    if (tc2_avg < (temp_sp2 - HYSTERESIS_TC2) && !relay2_on)
+    {
+      digitalWrite(RELAY2_PIN, LOW);   // Turn heater ON
+      relay2_on = true;
+    }
+    else if (tc2_avg > (temp_sp2 + HYSTERESIS_TC2) && relay2_on)
+    {
+      digitalWrite(RELAY2_PIN, HIGH);  // Turn heater OFF
+      relay2_on = false;
+    }
 
-    if (tc3_avg > temp_sp3)
-      digitalWrite(RELAY3_PIN, HIGH);
-    else
-      digitalWrite(RELAY3_PIN, LOW);
+    // TC3 (precursor 1) - hysteresis control
+    if (tc3_avg < (temp_sp3 - HYSTERESIS_TC3) && !relay3_on)
+    {
+      digitalWrite(RELAY3_PIN, LOW);   // Turn heater ON
+      relay3_on = true;
+    }
+    else if (tc3_avg > (temp_sp3 + HYSTERESIS_TC3) && relay3_on)
+    {
+      digitalWrite(RELAY3_PIN, HIGH);  // Turn heater OFF
+      relay3_on = false;
+    }
 
-    if (tc4_avg > temp_sp4)
-      digitalWrite(RELAY4_PIN, HIGH);
-    else
-      digitalWrite(RELAY4_PIN, LOW);
+    // TC4 (precursor 2) - hysteresis control
+    if (tc4_avg < (temp_sp4 - HYSTERESIS_TC4) && !relay4_on)
+    {
+      digitalWrite(RELAY4_PIN, LOW);   // Turn heater ON
+      relay4_on = true;
+    }
+    else if (tc4_avg > (temp_sp4 + HYSTERESIS_TC4) && relay4_on)
+    {
+      digitalWrite(RELAY4_PIN, HIGH);  // Turn heater OFF
+      relay4_on = false;
+    }
 
-    if (tc5_avg > temp_sp5)
-      digitalWrite(RELAY1_PIN, HIGH);
-    else
-      digitalWrite(RELAY1_PIN, LOW);
+    // TC5 (substrate heater) - hysteresis control
+    if (tc5_avg < (temp_sp5 - HYSTERESIS_TC5) && !relay1_on)
+    {
+      digitalWrite(RELAY1_PIN, LOW);   // Turn heater ON
+      relay1_on = true;
+    }
+    else if (tc5_avg > (temp_sp5 + HYSTERESIS_TC5) && relay1_on)
+    {
+      digitalWrite(RELAY1_PIN, HIGH);  // Turn heater OFF
+      relay1_on = false;
+    }
   }
 }
 

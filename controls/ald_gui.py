@@ -7,7 +7,7 @@ import winsound
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QLabel, QLineEdit, QPushButton, 
                             QTextEdit, QTabWidget, QGroupBox, QMessageBox, QFileDialog,
-                            QInputDialog, QProgressBar, QGridLayout)
+                            QInputDialog, QProgressBar, QGridLayout, QScrollArea)
 from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtGui import QColor, QPalette, QPen
 from PyQt6.QtCharts import QChart, QChartView, QLineSeries, QValueAxis, QDateTimeAxis
@@ -22,10 +22,10 @@ class ALDMainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.controller = ALDController()
-        
+        self.valve_done_event = asyncio.Event()
         # Temperature setpoints for safety monitoring
         self.temp_setpoints = {'tc2': 25, 'tc3': 30, 'tc4': 35, 'tc5': 40}
-        
+        self.temp_setpoints_initialized = False  
         # Temperature data storage
         self.temp_data = {
             'tc2': deque(maxlen=10000),
@@ -131,6 +131,8 @@ class ALDMainWindow(QMainWindow):
                 pass
     
     def check_temperature_safety(self, tc2, tc3, tc4, tc5):
+        if not self.temp_setpoints_initialized:
+            return
         """Check if any temperature exceeds setpoint by more than 50°C"""
         overheat_elements = []
         
@@ -217,6 +219,7 @@ class ALDMainWindow(QMainWindow):
             self.progress_bar.setValue(100)
             self.time_remaining_label.setText("Complete")
             self.log_text.append(f"[DEBUG] Set valve_job_running = False (job complete)")
+            self.valve_done_event.set()
         
         elif "command ignored" in msg_lower:
             self.log_text.append(f"[DEBUG] Arduino ignored command")
@@ -233,17 +236,19 @@ class ALDMainWindow(QMainWindow):
             self.log_text.append(f"[DEBUG] Set valve_job_running = False (emergency stop)")
             self.status_label.setText("🚨 EMERGENCY STOP ACTIVE")
             self.status_label.setStyleSheet("background-color: #c0392b; color: white; padding: 10px; font-weight: bold;")
-        
+            self.valve_done_event.set()
+
         elif "reset command received" in msg_lower:
             self.valve_job_running = False
             self.job_timer.stop()
             self.progress_bar.setValue(0)
             self.time_remaining_label.setText("--")
             self.log_text.append(f"[DEBUG] Set valve_job_running = False (reset)")
-    
+            self.valve_done_event.set()
     def setup_ui(self):
         self.setWindowTitle("ALD Control System")
-        self.setGeometry(100, 100, 1200, 900)
+        self.setGeometry(100, 100, 1400, 1000)
+        self.setMinimumSize(1200, 800)
         
         central = QWidget()
         self.setCentralWidget(central)
@@ -252,6 +257,7 @@ class ALDMainWindow(QMainWindow):
         # Status bar at top
         self.status_label = QLabel("Not Connected")
         self.status_label.setStyleSheet("background-color: #e74c3c; color: white; padding: 10px; font-weight: bold;")
+        self.status_label.setMinimumHeight(30)
         main_layout.addWidget(self.status_label)
         
         # Connection controls
@@ -283,7 +289,10 @@ class ALDMainWindow(QMainWindow):
         conn_layout.addWidget(self.reset_btn)
         
         conn_layout.addStretch()
-        main_layout.addLayout(conn_layout)
+        conn_widget = QWidget()
+        conn_widget.setLayout(conn_layout)
+        conn_widget.setMinimumHeight(40)
+        main_layout.addWidget(conn_widget)
         
         # Progress bar for job timing
         progress_layout = QHBoxLayout()
@@ -293,36 +302,50 @@ class ALDMainWindow(QMainWindow):
         self.progress_bar.setMaximum(100)
         self.progress_bar.setValue(0)
         self.progress_bar.setTextVisible(True)
+        self.progress_bar.setMinimumHeight(25)
         progress_layout.addWidget(self.progress_bar)
         
         self.time_remaining_label = QLabel("--")
         self.time_remaining_label.setMinimumWidth(120)
         self.time_remaining_label.setStyleSheet("font-weight: bold; padding: 5px;")
         progress_layout.addWidget(self.time_remaining_label)
-        main_layout.addLayout(progress_layout)
+        progress_widget = QWidget()
+        progress_widget.setLayout(progress_layout)
+        progress_widget.setMinimumHeight(40)
+        main_layout.addWidget(progress_widget)
         
-        # Tabs
+        # Tabs with scroll area
         self.tabs = QTabWidget()
-        main_layout.addWidget(self.tabs)
+        self.tabs.setMinimumHeight(400)
+        main_layout.addWidget(self.tabs, stretch=1)
         
         self.setup_monitor_tab()  # Main control + monitoring tab
         self.setup_recipe_tab()
         self.setup_log_tab()
         
         # Log at bottom
-        main_layout.addWidget(QLabel("Arduino Log:"))
+        log_label = QLabel("Arduino Log:")
+        log_label.setMinimumHeight(20)
+        main_layout.addWidget(log_label)
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
         self.log_text.setMaximumHeight(120)
+        self.log_text.setMinimumHeight(80)
         main_layout.addWidget(self.log_text)
     
     def setup_monitor_tab(self):
         """Setup the combined process monitor tab with all controls and monitoring"""
+        # Create scroll area for the tab content
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        
         widget = QWidget()
         layout = QVBoxLayout(widget)
+        layout.setContentsMargins(5, 5, 5, 5)
         
         # Top section: Controls side by side
         controls_layout = QHBoxLayout()
+        controls_layout.setContentsMargins(0, 0, 0, 0)
         
         # Valve Controls
         valve_group = QGroupBox("Valve Control")
@@ -354,6 +377,7 @@ class ALDMainWindow(QMainWindow):
         valve_layout.addWidget(send_valve_btn, 4, 0, 1, 2)
         
         valve_group.setLayout(valve_layout)
+        valve_group.setMinimumWidth(250)
         controls_layout.addWidget(valve_group)
         
         # Temperature Setpoints
@@ -390,6 +414,7 @@ class ALDMainWindow(QMainWindow):
         temp_layout.addWidget(send_temp_btn, 4, 0, 1, 3)
         
         temp_group.setLayout(temp_layout)
+        temp_group.setMinimumWidth(250)
         controls_layout.addWidget(temp_group)
         
         # Pressure & Flow readings
@@ -516,11 +541,23 @@ class ALDMainWindow(QMainWindow):
         self.chart_view.setMinimumHeight(350)
         layout.addWidget(self.chart_view, stretch=1)
         
-        self.tabs.addTab(widget, "Process Monitor")
+        # Pressure graph with time axis
+        self.setup_pressure_chart()
+        self.pressure_chart_view.setMinimumHeight(250)
+        layout.addWidget(self.pressure_chart_view, stretch=0)
+        
+        layout.addStretch()
+        scroll.setWidget(widget)
+        self.tabs.addTab(scroll, "Process Monitor")
     
     def setup_recipe_tab(self):
+        # Create scroll area for the tab content
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        
         widget = QWidget()
         layout = QVBoxLayout(widget)
+        layout.setContentsMargins(5, 5, 5, 5)
         
         # Recipe builder section
         builder_group = QGroupBox("Recipe Builder")
@@ -626,7 +663,8 @@ class ALDMainWindow(QMainWindow):
         layout.addWidget(exec_group)
         
         layout.addStretch()
-        self.tabs.addTab(widget, "Recipes")
+        scroll.setWidget(widget)
+        self.tabs.addTab(scroll, "Recipes")
     
     def setup_temperature_chart(self):
         """Setup the temperature monitoring chart with time-based X axis"""
@@ -684,6 +722,40 @@ class ALDMainWindow(QMainWindow):
         from PyQt6.QtGui import QPainter
         self.chart_view.setRenderHint(QPainter.RenderHint.Antialiasing)
     
+    def setup_pressure_chart(self):
+        """Setup the pressure monitoring chart with time-based X axis"""
+        self.pressure_chart = QChart()
+        self.pressure_chart.setTitle("Pressure vs Time")
+        self.pressure_chart.setAnimationOptions(QChart.AnimationOption.NoAnimation)
+        
+        # Create series for pressure
+        self.pressure_series = QLineSeries()
+        self.pressure_series.setName("Pressure")
+        self.pressure_series.setPen(QPen(QColor('#16a085'), 2))
+        
+        self.pressure_chart.addSeries(self.pressure_series)
+        
+        # Setup time-based X axis
+        self.pressure_axis_x = QValueAxis()
+        self.pressure_axis_x.setTitleText("Time (seconds)")
+        self.pressure_axis_x.setRange(0, 120)
+        self.pressure_axis_x.setLabelFormat("%d")
+        
+        self.pressure_axis_y = QValueAxis()
+        self.pressure_axis_y.setTitleText("Pressure (mTorr)")
+        self.pressure_axis_y.setRange(0, 100)
+        
+        self.pressure_chart.addAxis(self.pressure_axis_x, Qt.AlignmentFlag.AlignBottom)
+        self.pressure_chart.addAxis(self.pressure_axis_y, Qt.AlignmentFlag.AlignLeft)
+        
+        self.pressure_series.attachAxis(self.pressure_axis_x)
+        self.pressure_series.attachAxis(self.pressure_axis_y)
+        
+        # Create chart view
+        self.pressure_chart_view = QChartView(self.pressure_chart)
+        from PyQt6.QtGui import QPainter
+        self.pressure_chart_view.setRenderHint(QPainter.RenderHint.Antialiasing)
+    
     def format_delta(self, current, setpoint):
         """Format delta value with color coding"""
         if current is None:
@@ -706,7 +778,7 @@ class ALDMainWindow(QMainWindow):
             return f"{delta:.1f}°C", "color: #3498db; font-weight: bold;"  # Blue
     
     def update_graph(self):
-        """Update the temperature graph with latest data - optimized for performance"""
+        """Update the temperature and pressure graphs with latest data - optimized for performance"""
         if not self.graph_update_pending or len(self.temp_data['timestamp']) == 0:
             self.update_sensor_readings()
             return
@@ -721,6 +793,7 @@ class ALDMainWindow(QMainWindow):
         data_len = len(self.temp_data['timestamp'])
         start_idx = max(0, data_len - max_display_points)
         
+        # Update temperature series
         self.tc2_series.clear()
         self.tc3_series.clear()
         self.tc4_series.clear()
@@ -739,8 +812,21 @@ class ALDMainWindow(QMainWindow):
             self.tc4_series.append(time_sec, tc4_vals[i])
             self.tc5_series.append(time_sec, tc5_vals[i])
         
+        # Update pressure series
+        self.pressure_series.clear()
+        pressure_data_len = len(self.pressure_data['timestamp'])
+        pressure_start_idx = max(0, pressure_data_len - max_display_points)
+        
+        pressure_timestamps = list(self.pressure_data['timestamp'])
+        pressure_vals = list(self.pressure_data['value'])
+        
+        for i in range(pressure_start_idx, pressure_data_len):
+            time_sec = (pressure_timestamps[i] - self.start_time).total_seconds()
+            self.pressure_series.append(time_sec, pressure_vals[i])
+        
         self.update_sensor_readings()
         
+        # Update temperature axes
         if data_len > 0:
             all_temps = tc2_vals[start_idx:] + tc3_vals[start_idx:] + \
                        tc4_vals[start_idx:] + tc5_vals[start_idx:]
@@ -754,6 +840,20 @@ class ALDMainWindow(QMainWindow):
             max_time = (timestamps[-1] - self.start_time).total_seconds()
             min_time = (timestamps[start_idx] - self.start_time).total_seconds() if start_idx > 0 else 0
             self.axis_x.setRange(min_time, max(max_time + 5, 120))
+        
+        # Update pressure axes
+        if pressure_data_len > 0:
+            pressure_vals_range = pressure_vals[pressure_start_idx:]
+            if pressure_vals_range:
+                min_pressure = min(pressure_vals_range)
+                max_pressure = max(pressure_vals_range)
+                range_pressure = max_pressure - min_pressure if max_pressure > min_pressure else 10
+                self.pressure_axis_y.setRange(max(0, min_pressure - range_pressure * 0.1),
+                                             max_pressure + range_pressure * 0.1)
+            
+            max_time = (pressure_timestamps[-1] - self.start_time).total_seconds()
+            min_time = (pressure_timestamps[pressure_start_idx] - self.start_time).total_seconds() if pressure_start_idx > 0 else 0
+            self.pressure_axis_x.setRange(min_time, max(max_time + 5, 120))
     
     def update_sensor_readings(self):
         """Update the sensor reading labels with setpoint comparison"""
@@ -810,13 +910,13 @@ class ALDMainWindow(QMainWindow):
         
         # Flow is below threshold - alarm should be active
         if current_flow < self.flow_alarm_threshold:
-            if not self.flow_alarm_active:
+            # Only show if not already showing (prevents spam after manual dismiss)
+            if not self.flow_alarm_active or (self.flow_alarm_dialog is None or not self.flow_alarm_dialog.isVisible()):
                 self.flow_alarm_active = True
                 self.show_flow_alarm()
         # Flow is above threshold - alarm should be dismissed
         else:
             if self.flow_alarm_active:
-                self.flow_alarm_active = False
                 self.dismiss_flow_alarm()
     
     def show_flow_alarm(self):
@@ -872,10 +972,17 @@ class ALDMainWindow(QMainWindow):
             self.job_timer.stop()
             self.progress_bar.setValue(100)
             self.time_remaining_label.setText("Complete")
+            self.valve_job_running = False
+            self.valve_done_event.set()
 
     def setup_log_tab(self):
+        # Create scroll area for the tab content
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        
         widget = QWidget()
         layout = QVBoxLayout(widget)
+        layout.setContentsMargins(5, 5, 5, 5)
         
         # Test and BEGIN buttons
         h = QHBoxLayout()
@@ -904,7 +1011,8 @@ class ALDMainWindow(QMainWindow):
         self.full_log.setReadOnly(True)
         layout.addWidget(self.full_log)
         
-        self.tabs.addTab(widget, "Commands & Log")
+        scroll.setWidget(widget)
+        self.tabs.addTab(scroll, "Commands & Log")
     
     def calculate_valve_duration(self, num_pulses, pulse_time, purge_time):
         """Calculate total duration of a valve command in milliseconds"""
@@ -1081,7 +1189,7 @@ class ALDMainWindow(QMainWindow):
         try:
             # Update setpoints for safety monitoring and display
             self.temp_setpoints = {'tc2': tc2, 'tc3': tc3, 'tc4': tc4, 'tc5': tc5}
-            
+            self.temp_setpoints_initialized = True
             # Update setpoint display labels immediately (with arrow prefix)
             self.tc2_setpoint_display.setText(f"→ {tc2}°C")
             self.tc3_setpoint_display.setText(f"→ {tc3}°C")
@@ -1265,15 +1373,15 @@ class ALDMainWindow(QMainWindow):
                 QMessageBox.critical(self, "Export Failed", f"Could not export log:\n{e}")
     
     def export_temperature_data(self):
-        """Export temperature data to CSV file"""
+        """Export temperature and pressure data to CSV file"""
         if len(self.temp_data['time']) == 0:
             QMessageBox.warning(self, "No Data", "No temperature data to export yet.")
             return
         
         filename, _ = QFileDialog.getSaveFileName(
             self,
-            "Export Temperature Data",
-            f"temp_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+            "Export Temperature and Pressure Data",
+            f"temp_pressure_data_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
             "CSV Files (*.csv)"
         )
         
@@ -1281,23 +1389,36 @@ class ALDMainWindow(QMainWindow):
             try:
                 with open(filename, 'w', newline='') as f:
                     writer = csv.writer(f)
-                    writer.writerow(['Timestamp', 'Time (s)', 'TC2 (°C)', 'TC3 (°C)', 'TC4 (°C)', 'TC5 (°C)'])
+                    writer.writerow(['Timestamp', 'Time (s)', 'TC2 (°C)', 'TC3 (°C)', 'TC4 (°C)', 'TC5 (°C)', 'Pressure (mTorr)'])
+                    
+                    pressure_timestamps = list(self.pressure_data['timestamp'])
+                    pressure_vals = list(self.pressure_data['value'])
                     
                     for i in range(len(self.temp_data['time'])):
                         time_sec = (self.temp_data['timestamp'][i] - self.start_time).total_seconds() if self.start_time else 0
+                        
+                        # Find closest pressure reading for this timestamp
+                        pressure_val = ''
+                        if pressure_timestamps:
+                            # Find the pressure reading closest in time to this temperature reading
+                            closest_idx = min(range(len(pressure_timestamps)), 
+                                            key=lambda j: abs((pressure_timestamps[j] - self.temp_data['timestamp'][i]).total_seconds()))
+                            pressure_val = f"{pressure_vals[closest_idx]:.2f}"
+                        
                         writer.writerow([
                             self.temp_data['timestamp'][i].strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
                             f"{time_sec:.1f}",
                             self.temp_data['tc2'][i],
                             self.temp_data['tc3'][i],
                             self.temp_data['tc4'][i],
-                            self.temp_data['tc5'][i]
+                            self.temp_data['tc5'][i],
+                            pressure_val
                         ])
                 
                 QMessageBox.information(
                     self,
                     "Export Successful",
-                    f"Temperature data exported to:\n{filename}\n\n{len(self.temp_data['time'])} samples saved."
+                    f"Temperature and pressure data exported to:\n{filename}\n\n{len(self.temp_data['time'])} samples saved."
                 )
             except Exception as e:
                 QMessageBox.critical(self, "Export Failed", f"Could not export data:\n{e}")
@@ -1421,7 +1542,6 @@ class ALDMainWindow(QMainWindow):
     
     @asyncSlot()
     async def run_recipe(self):
-        """Execute the loaded recipe"""
         if self.current_recipe is None:
             QMessageBox.warning(self, "No Recipe", "Please load a recipe first.")
             return
@@ -1434,7 +1554,7 @@ class ALDMainWindow(QMainWindow):
             QMessageBox.warning(self, "Busy", "Another operation is in progress. Please wait.")
             return
         
-        # Calculate total recipe duration
+        # Calculate total recipe duration for display
         total_duration_ms = 0
         for step in self.current_recipe.steps:
             if step['type'] == 'valve':
@@ -1444,7 +1564,7 @@ class ALDMainWindow(QMainWindow):
             elif step['type'] == 'wait':
                 total_duration_ms += step['duration'] * 1000
         
-        total_duration_str = f"{total_duration_ms/1000:.0f} seconds ({total_duration_ms/60000:.1f} minutes)"
+        total_duration_str = f"{total_duration_ms/1000:.0f}s ({total_duration_ms/60000:.1f} min)"
         
         reply = QMessageBox.question(
             self,
@@ -1460,10 +1580,10 @@ class ALDMainWindow(QMainWindow):
             return
         
         self.recipe_running = True
+        self.operation_in_progress = True
         self.run_recipe_btn.setEnabled(False)
         self.recipe_total_steps = len(self.current_recipe.steps)
         
-        # Setup overall recipe progress tracking
         self.job_total_duration = total_duration_ms
         self.job_start_time = datetime.now()
         self.progress_bar.setValue(0)
@@ -1473,67 +1593,79 @@ class ALDMainWindow(QMainWindow):
             for i, step in enumerate(self.current_recipe.steps, 1):
                 self.recipe_step_index = i
                 self.recipe_step_label.setText(f"{i}/{self.recipe_total_steps}")
-                self.log_text.append(f"[RECIPE] Step {i}/{self.recipe_total_steps}")
+                self.log_text.append(f"[RECIPE] Step {i}/{self.recipe_total_steps}: {step['type']}")
                 
                 if step['type'] == 'valve':
-                    self.log_text.append(f"[RECIPE] Executing valve command...")
+                    # Clear the event before sending so we wait for THIS command's completion
+                    self.valve_done_event.clear()
+                    self.valve_job_running = True
+                    
                     await self.controller.valve(
                         step['valve_id'],
                         step['num_pulses'],
                         step['pulse_time'],
                         step['purge_time']
                     )
-                    self.valve_job_running = True
+                    self.log_text.append(f"[RECIPE] Valve command sent, waiting for completion...")
                     
-                    # Wait for valve job to complete
-                    timeout = 0
-                    while self.valve_job_running and timeout < 600:
-                        await asyncio.sleep(1)
-                        timeout += 1
+                    # Wait for completion signal with a generous timeout
+                    valve_duration_sec = self.calculate_valve_duration(
+                        step['num_pulses'], step['pulse_time'], step['purge_time']
+                    ) / 1000
+                    timeout_sec = valve_duration_sec + 30  # 30s grace period
                     
-                    if timeout >= 600:
-                        raise Exception("Valve command timed out")
+                    try:
+                        await asyncio.wait_for(self.valve_done_event.wait(), timeout=timeout_sec)
+                        self.log_text.append(f"[RECIPE] Valve step complete")
+                    except asyncio.TimeoutError:
+                        raise Exception(
+                            f"Valve step {i} timed out after {timeout_sec:.0f}s "
+                            f"(expected ~{valve_duration_sec:.0f}s)"
+                        )
                 
                 elif step['type'] == 'temp':
-                    self.log_text.append(f"[RECIPE] Setting temperatures...")
                     await self.controller.temp(
-                        step['tc2'],
-                        step['tc3'],
-                        step['tc4'],
-                        step['tc5']
+                        step['tc2'], step['tc3'], step['tc4'], step['tc5']
                     )
-                    # Update setpoints for safety monitoring
                     self.temp_setpoints = {
-                        'tc2': step['tc2'],
-                        'tc3': step['tc3'],
-                        'tc4': step['tc4'],
-                        'tc5': step['tc5']
+                        'tc2': step['tc2'], 'tc3': step['tc3'],
+                        'tc4': step['tc4'], 'tc5': step['tc5']
                     }
-                    # Update display (with arrow prefix)
+                    self.temp_setpoints_initialized = True
                     self.tc2_setpoint_display.setText(f"→ {step['tc2']}°C")
                     self.tc3_setpoint_display.setText(f"→ {step['tc3']}°C")
                     self.tc4_setpoint_display.setText(f"→ {step['tc4']}°C")
                     self.tc5_setpoint_display.setText(f"→ {step['tc5']}°C")
+                    self.log_text.append(f"[RECIPE] Temperature step complete")
                 
                 elif step['type'] == 'wait':
-                    self.log_text.append(f"[RECIPE] Waiting {step['duration']} seconds...")
-                    await asyncio.sleep(step['duration'])
+                    self.log_text.append(f"[RECIPE] Waiting {step['duration']}s...")
+                    # Yield to Qt event loop in small chunks so UI stays responsive
+                    remaining = step['duration']
+                    while remaining > 0:
+                        chunk = min(remaining, 1)
+                        await asyncio.sleep(chunk)
+                        remaining -= chunk
+                        # Update time remaining display during wait
+                        self.time_remaining_label.setText(f"{remaining}s remaining (wait)")
+                    self.log_text.append(f"[RECIPE] Wait complete")
             
-            self.log_text.append(f"[RECIPE] Recipe '{self.current_recipe.name}' completed successfully!")
+            self.log_text.append(f"[RECIPE] '{self.current_recipe.name}' completed successfully!")
             self.recipe_step_label.setText("Complete")
             QMessageBox.information(self, "Recipe Complete", "Recipe executed successfully!")
-            
+        
         except Exception as e:
-            self.log_text.append(f"[RECIPE] Error: {e}")
-            QMessageBox.critical(self, "Recipe Failed", f"Recipe execution failed:\n{e}")
+            self.log_text.append(f"[RECIPE] Error at step {self.recipe_step_index}: {e}")
+            QMessageBox.critical(self, "Recipe Failed", f"Recipe failed at step {self.recipe_step_index}:\n\n{e}")
         
         finally:
             self.recipe_running = False
+            self.operation_in_progress = False
+            self.valve_job_running = False
             self.run_recipe_btn.setEnabled(True)
             self.job_timer.stop()
             self.progress_bar.setValue(100)
             self.time_remaining_label.setText("Complete")
-
 def main():
     app = QApplication(sys.argv)
     
