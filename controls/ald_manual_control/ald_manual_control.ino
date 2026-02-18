@@ -164,9 +164,9 @@ void readThermocouples()
   }
 
   // tc1_readings[index] = current_reading[0];
-  tc2_readings[index] = current_reading[1];
+  tc2_readings[index] = current_reading[3];
   tc3_readings[index] = current_reading[2];
-  tc4_readings[index] = current_reading[3];
+  tc4_readings[index] = current_reading[1];
   tc5_readings[index] = current_reading[0];
   // tc6_readings[index] = current_reading[5];
   // tc7_readings[index] = current_reading[6];
