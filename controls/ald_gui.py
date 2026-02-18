@@ -110,9 +110,9 @@ class ALDMainWindow(QMainWindow):
                     if self.start_time is None:
                         self.start_time = now
                     
-                    tc2_val = float(temps[0])
+                    tc2_val = float(temps[2])
                     tc3_val = float(temps[1])
-                    tc4_val = float(temps[2])
+                    tc4_val = float(temps[0])
                     tc5_val = float(temps[3])
                     
                     self.temp_data['tc2'].append(tc2_val)
