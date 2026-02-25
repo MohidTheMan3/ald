@@ -209,12 +209,12 @@ void actuateHeatingElements()
     // TC2 (delivery line tape) - hysteresis control
     if (tc2_avg < (temp_sp2 - HYSTERESIS_TC2) && !relay2_on)
     {
-      digitalWrite(RELAY2_PIN, LOW);   // Turn heater ON
+      digitalWrite(RELAY4_PIN, LOW);   // Turn heater ON
       relay2_on = true;
     }
     else if (tc2_avg > (temp_sp2 + HYSTERESIS_TC2) && relay2_on)
     {
-      digitalWrite(RELAY2_PIN, HIGH);  // Turn heater OFF
+      digitalWrite(RELAY4_PIN, HIGH);  // Turn heater OFF
       relay2_on = false;
     }
 
@@ -233,12 +233,12 @@ void actuateHeatingElements()
     // TC4 (precursor 2) - hysteresis control
     if (tc4_avg < (temp_sp4 - HYSTERESIS_TC4) && !relay4_on)
     {
-      digitalWrite(RELAY4_PIN, LOW);   // Turn heater ON
+      digitalWrite(RELAY2_PIN, LOW);   // Turn heater ON
       relay4_on = true;
     }
     else if (tc4_avg > (temp_sp4 + HYSTERESIS_TC4) && relay4_on)
     {
-      digitalWrite(RELAY4_PIN, HIGH);  // Turn heater OFF
+      digitalWrite(RELAY2_PIN, HIGH);  // Turn heater OFF
       relay4_on = false;
     }
 
