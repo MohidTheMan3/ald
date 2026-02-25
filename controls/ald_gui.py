@@ -28,24 +28,24 @@ class ALDMainWindow(QMainWindow):
         self.temp_setpoints_initialized = False  
         # Temperature data storage
         self.temp_data = {
-            'tc2': deque(maxlen=10000),
-            'tc3': deque(maxlen=10000),
-            'tc4': deque(maxlen=10000),
-            'tc5': deque(maxlen=10000),
-            'time': deque(maxlen=10000),
-            'timestamp': deque(maxlen=10000)
+            'tc2': deque(maxlen=100000),
+            'tc3': deque(maxlen=100000),
+            'tc4': deque(maxlen=100000),
+            'tc5': deque(maxlen=100000),
+            'time': deque(maxlen=100000),
+            'timestamp': deque(maxlen=100000)
         }
         # Pressure and flow data storage
         self.pressure_data = {
-            'value': deque(maxlen=10000),
-            'unit': deque(maxlen=10000),
-            'time': deque(maxlen=10000),
-            'timestamp': deque(maxlen=10000)
+            'value': deque(maxlen=100000),
+            'unit': deque(maxlen=100000),
+            'time': deque(maxlen=100000),
+            'timestamp': deque(maxlen=100000)
         }
         self.flow_data = {
-            'value': deque(maxlen=10000),
-            'time': deque(maxlen=10000),
-            'timestamp': deque(maxlen=10000)
+            'value': deque(maxlen=100000),
+            'time': deque(maxlen=100000),
+            'timestamp': deque(maxlen=100000)
         }
         self.time_counter = 0
         self.start_time = None
