@@ -1112,7 +1112,7 @@ class ALDMainWindow(QMainWindow):
         self.operation_in_progress = True
         try:
             # Calculate and start progress tracking
-            self.job_total_duration = self.calculate_valve_duration(num_pulses, pulse_time, purge_time)
+            self.job_total_duration = self.calculate_valve_duration(num_pulses, pulse_time, purge_time) + 3000
             self.job_start_time = datetime.now()
             self.progress_bar.setValue(0)
             self.job_timer.start(100)
@@ -1584,7 +1584,7 @@ class ALDMainWindow(QMainWindow):
         self.run_recipe_btn.setEnabled(False)
         self.recipe_total_steps = len(self.current_recipe.steps)
         
-        self.job_total_duration = total_duration_ms
+        self.job_total_duration = total_duration_ms + 3000
         self.job_start_time = datetime.now()
         self.progress_bar.setValue(0)
         self.job_timer.start(100)
