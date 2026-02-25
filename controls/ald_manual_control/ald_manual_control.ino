@@ -92,12 +92,11 @@ int temp_sp4 = 0; // precursor 2 (K-type, pin 6)
 int temp_sp5 = 0; // substrate heater (K-type, pin 3 - FIRST K-TYPE PORT)
 
 // Hysteresis offsets for heating elements (in °C)
-// Turn ON when temp < setpoint - HYSTERESIS_OFFSET
-// Turn OFF when temp > setpoint + HYSTERESIS_OFFSET
-const int HYSTERESIS_TC2 = 5;  // delivery line tape
-const int HYSTERESIS_TC3 = 5;  // precursor 1
-const int HYSTERESIS_TC4 = 5;  // precursor 2
-const int HYSTERESIS_TC5 = 5;  // substrate heater
+// Set to 0 to disable hysteresis - turns on/off at exact setpoint
+const int HYSTERESIS_TC2 = 0;  // delivery line tape
+const int HYSTERESIS_TC3 = 0;  // precursor 1
+const int HYSTERESIS_TC4 = 0;  // precursor 2
+const int HYSTERESIS_TC5 = 0;  // substrate heater
 
 // Track relay states for hysteresis logic
 bool relay2_on = false;
@@ -210,12 +209,12 @@ void actuateHeatingElements()
     // TC2 (delivery line tape) - hysteresis control
     if (tc2_avg < (temp_sp2 - HYSTERESIS_TC2) && !relay2_on)
     {
-      digitalWrite(RELAY4_PIN, LOW);   // Turn heater ON
+      digitalWrite(RELAY2_PIN, LOW);   // Turn heater ON
       relay2_on = true;
     }
     else if (tc2_avg > (temp_sp2 + HYSTERESIS_TC2) && relay2_on)
     {
-      digitalWrite(RELAY4_PIN, HIGH);  // Turn heater OFF
+      digitalWrite(RELAY2_PIN, HIGH);  // Turn heater OFF
       relay2_on = false;
     }
 
@@ -234,12 +233,12 @@ void actuateHeatingElements()
     // TC4 (precursor 2) - hysteresis control
     if (tc4_avg < (temp_sp4 - HYSTERESIS_TC4) && !relay4_on)
     {
-      digitalWrite(RELAY2_PIN, LOW);   // Turn heater ON
+      digitalWrite(RELAY4_PIN, LOW);   // Turn heater ON
       relay4_on = true;
     }
     else if (tc4_avg > (temp_sp4 + HYSTERESIS_TC4) && relay4_on)
     {
-      digitalWrite(RELAY2_PIN, HIGH);  // Turn heater OFF
+      digitalWrite(RELAY4_PIN, HIGH);  // Turn heater OFF
       relay4_on = false;
     }
 
