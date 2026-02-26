@@ -219,7 +219,7 @@ class ALDMainWindow(QMainWindow):
             self.progress_bar.setValue(100)
             self.time_remaining_label.setText("Complete")
             self.log_text.append(f"[DEBUG] Set valve_job_running = False (job complete)")
-            self.valve_done_event.set()
+            asyncio.get_event_loop().call_soon(self.valve_done_event.set)
         
         elif "command ignored" in msg_lower:
             self.log_text.append(f"[DEBUG] Arduino ignored command")
@@ -236,7 +236,7 @@ class ALDMainWindow(QMainWindow):
             self.log_text.append(f"[DEBUG] Set valve_job_running = False (emergency stop)")
             self.status_label.setText("🚨 EMERGENCY STOP ACTIVE")
             self.status_label.setStyleSheet("background-color: #c0392b; color: white; padding: 10px; font-weight: bold;")
-            self.valve_done_event.set()
+            asyncio.get_event_loop().call_soon(self.valve_done_event.set)
 
         elif "reset command received" in msg_lower:
             self.valve_job_running = False
@@ -244,7 +244,7 @@ class ALDMainWindow(QMainWindow):
             self.progress_bar.setValue(0)
             self.time_remaining_label.setText("--")
             self.log_text.append(f"[DEBUG] Set valve_job_running = False (reset)")
-            self.valve_done_event.set()
+            asyncio.get_event_loop().call_soon(self.valve_done_event.set)
     def setup_ui(self):
         self.setWindowTitle("ALD Control System")
         self.setGeometry(100, 100, 1400, 1000)
@@ -973,7 +973,7 @@ class ALDMainWindow(QMainWindow):
             self.progress_bar.setValue(100)
             self.time_remaining_label.setText("Complete")
             self.valve_job_running = False
-            self.valve_done_event.set()
+            asyncio.get_event_loop().call_soon(self.valve_done_event.set)
 
     def setup_log_tab(self):
         # Create scroll area for the tab content
@@ -1614,14 +1614,17 @@ class ALDMainWindow(QMainWindow):
                     ) / 1000
                     timeout_sec = valve_duration_sec + 30  # 30s grace period
                     
-                    try:
-                        await asyncio.wait_for(self.valve_done_event.wait(), timeout=timeout_sec)
-                        self.log_text.append(f"[RECIPE] Valve step complete")
-                    except asyncio.TimeoutError:
-                        raise Exception(
-                            f"Valve step {i} timed out after {timeout_sec:.0f}s "
-                            f"(expected ~{valve_duration_sec:.0f}s)"
-                        )
+                    elapsed = 0.0
+                    poll_interval = 0.25  # seconds
+                    while not self.valve_done_event.is_set():
+                        await asyncio.sleep(poll_interval)
+                        elapsed += poll_interval
+                        if elapsed >= timeout_sec:
+                            raise Exception(
+                                f"Valve step {i} timed out after {timeout_sec:.0f}s "
+                                f"(expected ~{valve_duration_sec:.0f}s)"
+                            )
+                    self.log_text.append(f"[RECIPE] Valve step complete")
                 
                 elif step['type'] == 'temp':
                     await self.controller.temp(
