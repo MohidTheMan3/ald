@@ -80,7 +80,7 @@ class ALDMainWindow(QMainWindow):
         self.setup_ui()
         
         # Auto-connect callback
-        def handle_response(self, msg):
+        def handle_response(msg):
             # Only log non-sensor messages to the visible log
             msg_upper = msg.upper()
             if not (msg_upper.startswith('T:') or 
