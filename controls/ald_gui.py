@@ -1593,22 +1593,63 @@ class ALDMainWindow(QMainWindow):
                 self.run_recipe_btn.setEnabled(True)
             except Exception as e:
                 QMessageBox.critical(self, "Load Failed", f"Could not load recipe:\n{e}")
-    
+    async def wait_for_temp_stabilization(self, tc2_sp, tc3_sp, tc4_sp, tc5_sp, 
+                                        tolerance=2.0, stable_seconds=10, 
+                                        timeout_seconds=600):
+        """Wait until all TCs are within tolerance of setpoints for stable_seconds"""
+        stable_count = 0
+        required_count = stable_seconds  # checking every ~1s
+        elapsed = 0
+
+        while elapsed < timeout_seconds:
+            await asyncio.sleep(1)
+            elapsed += 1
+
+            if len(self.temp_data['tc2']) == 0:
+                continue
+
+            tc2 = self.temp_data['tc2'][-1]
+            tc3 = self.temp_data['tc3'][-1]
+            tc4 = self.temp_data['tc4'][-1]
+            tc5 = self.temp_data['tc5'][-1]
+
+            all_stable = (
+                abs(tc2 - tc2_sp) <= tolerance and
+                abs(tc3 - tc3_sp) <= tolerance and
+                abs(tc4 - tc4_sp) <= tolerance and
+                abs(tc5 - tc5_sp) <= tolerance
+            )
+
+            if all_stable:
+                stable_count += 1
+                self.log_text.append(
+                    f"[RECIPE] Temps stable {stable_count}/{required_count}s "
+                    f"(TC2:{tc2:.1f} TC3:{tc3:.1f} TC4:{tc4:.1f} TC5:{tc5:.1f})"
+                )
+            else:
+                stable_count = 0  # reset if any TC drifts out
+
+            if stable_count >= required_count:
+                return True
+
+        raise Exception(
+            f"Temperature stabilization timed out after {timeout_seconds}s. "
+            f"Last readings: TC2:{tc2:.1f} TC3:{tc3:.1f} TC4:{tc4:.1f} TC5:{tc5:.1f} "
+            f"Setpoints: {tc2_sp}/{tc3_sp}/{tc4_sp}/{tc5_sp}"
+        )
+
     @asyncSlot()
     async def run_recipe(self):
         if self.current_recipe is None:
             QMessageBox.warning(self, "No Recipe", "Please load a recipe first.")
             return
-        
         if self.recipe_running:
             QMessageBox.warning(self, "Recipe Running", "A recipe is already running.")
             return
-        
         if self.operation_in_progress:
             QMessageBox.warning(self, "Busy", "Another operation is in progress. Please wait.")
             return
-        
-        # Calculate total recipe duration for display
+
         total_duration_ms = 0
         for step in self.current_recipe.steps:
             if step['type'] == 'valve':
@@ -1617,69 +1658,48 @@ class ALDMainWindow(QMainWindow):
                 )
             elif step['type'] == 'wait':
                 total_duration_ms += step['duration'] * 1000
-        
-        total_duration_str = f"{total_duration_ms/1000:.0f}s ({total_duration_ms/60000:.1f} min)"
-        
+
         reply = QMessageBox.question(
-            self,
-            "Run Recipe",
+            self, "Run Recipe",
             f"Run recipe '{self.current_recipe.name}'?\n\n"
             f"Steps: {len(self.current_recipe.steps)}\n"
-            f"Estimated duration: {total_duration_str}\n\n"
+            f"Estimated duration (excl. heat-up): {total_duration_ms/60000:.1f} min\n\n"
             f"You can use Emergency Stop if needed.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
-        
         if reply != QMessageBox.StandardButton.Yes:
             return
-        
+
         self.recipe_running = True
         self.operation_in_progress = True
         self.run_recipe_btn.setEnabled(False)
         self.recipe_total_steps = len(self.current_recipe.steps)
-        
-        self.job_total_duration = total_duration_ms + 3000
-        self.job_start_time = datetime.now()
-        self.progress_bar.setValue(0)
-        self.job_timer.start(100)
-        
+
         try:
             for i, step in enumerate(self.current_recipe.steps, 1):
                 self.recipe_step_index = i
                 self.recipe_step_label.setText(f"{i}/{self.recipe_total_steps}")
                 self.log_text.append(f"[RECIPE] Step {i}/{self.recipe_total_steps}: {step['type']}")
-                
+
                 if step['type'] == 'valve':
-                    # Clear the event before sending so we wait for THIS command's completion
-                    self.valve_done_event.clear()
-                    self.valve_job_running = True
-                    
                     await self.controller.valve(
-                        step['valve_id'],
-                        step['num_pulses'],
-                        step['pulse_time'],
-                        step['purge_time']
+                        step['valve_id'], step['num_pulses'],
+                        step['pulse_time'], step['purge_time']
                     )
-                    self.log_text.append(f"[RECIPE] Valve command sent, waiting for completion...")
-                    
-                    # Wait for completion signal with a generous timeout
-                    valve_duration_sec = self.calculate_valve_duration(
+                    duration_sec = self.calculate_valve_duration(
                         step['num_pulses'], step['pulse_time'], step['purge_time']
                     ) / 1000
-                    timeout_sec = valve_duration_sec + 30  # 30s grace period
-                    
-                    elapsed = 0.0
-                    poll_interval = 0.25  # seconds
-                    while not self.valve_done_event.is_set():
-                        await asyncio.sleep(poll_interval)
-                        elapsed += poll_interval
-                        if elapsed >= timeout_sec:
-                            raise Exception(
-                                f"Valve step {i} timed out after {timeout_sec:.0f}s "
-                                f"(expected ~{valve_duration_sec:.0f}s)"
-                            )
+                    self.log_text.append(f"[RECIPE] Valve running, waiting {duration_sec:.1f}s...")
+
+                    # Count down in 1s chunks so UI stays responsive
+                    remaining = duration_sec
+                    while remaining > 0:
+                        chunk = min(remaining, 1)
+                        await asyncio.sleep(chunk)
+                        remaining -= chunk
+                        self.time_remaining_label.setText(f"{remaining:.0f}s remaining (valve)")
                     self.log_text.append(f"[RECIPE] Valve step complete")
-                
+
                 elif step['type'] == 'temp':
                     await self.controller.temp(
                         step['tc2'], step['tc3'], step['tc4'], step['tc5']
@@ -1693,36 +1713,168 @@ class ALDMainWindow(QMainWindow):
                     self.tc3_setpoint_display.setText(f"→ {step['tc3']}°C")
                     self.tc4_setpoint_display.setText(f"→ {step['tc4']}°C")
                     self.tc5_setpoint_display.setText(f"→ {step['tc5']}°C")
-                    self.log_text.append(f"[RECIPE] Temperature step complete")
-                
+                    self.log_text.append(
+                        f"[RECIPE] Waiting for temps to stabilize at "
+                        f"TC2:{step['tc2']} TC3:{step['tc3']} "
+                        f"TC4:{step['tc4']} TC5:{step['tc5']}°C..."
+                    )
+                    await self.wait_for_temp_stabilization(
+                        step['tc2'], step['tc3'], step['tc4'], step['tc5']
+                    )
+                    self.log_text.append(f"[RECIPE] Temperature step complete - all TCs stable")
+
                 elif step['type'] == 'wait':
                     self.log_text.append(f"[RECIPE] Waiting {step['duration']}s...")
-                    # Yield to Qt event loop in small chunks so UI stays responsive
                     remaining = step['duration']
                     while remaining > 0:
                         chunk = min(remaining, 1)
                         await asyncio.sleep(chunk)
                         remaining -= chunk
-                        # Update time remaining display during wait
                         self.time_remaining_label.setText(f"{remaining}s remaining (wait)")
                     self.log_text.append(f"[RECIPE] Wait complete")
-            
+
             self.log_text.append(f"[RECIPE] '{self.current_recipe.name}' completed successfully!")
             self.recipe_step_label.setText("Complete")
             QMessageBox.information(self, "Recipe Complete", "Recipe executed successfully!")
-        
+
         except Exception as e:
             self.log_text.append(f"[RECIPE] Error at step {self.recipe_step_index}: {e}")
-            QMessageBox.critical(self, "Recipe Failed", f"Recipe failed at step {self.recipe_step_index}:\n\n{e}")
-        
+            QMessageBox.critical(self, "Recipe Failed", 
+                                f"Recipe failed at step {self.recipe_step_index}:\n\n{e}")
         finally:
             self.recipe_running = False
             self.operation_in_progress = False
-            self.valve_job_running = False
             self.run_recipe_btn.setEnabled(True)
-            self.job_timer.stop()
-            self.progress_bar.setValue(100)
             self.time_remaining_label.setText("Complete")
+    # @asyncSlot()
+    # async def run_recipe(self):
+    #     if self.current_recipe is None:
+    #         QMessageBox.warning(self, "No Recipe", "Please load a recipe first.")
+    #         return
+        
+    #     if self.recipe_running:
+    #         QMessageBox.warning(self, "Recipe Running", "A recipe is already running.")
+    #         return
+        
+    #     if self.operation_in_progress:
+    #         QMessageBox.warning(self, "Busy", "Another operation is in progress. Please wait.")
+    #         return
+        
+    #     # Calculate total recipe duration for display
+    #     total_duration_ms = 0
+    #     for step in self.current_recipe.steps:
+    #         if step['type'] == 'valve':
+    #             total_duration_ms += self.calculate_valve_duration(
+    #                 step['num_pulses'], step['pulse_time'], step['purge_time']
+    #             )
+    #         elif step['type'] == 'wait':
+    #             total_duration_ms += step['duration'] * 1000
+        
+    #     total_duration_str = f"{total_duration_ms/1000:.0f}s ({total_duration_ms/60000:.1f} min)"
+        
+    #     reply = QMessageBox.question(
+    #         self,
+    #         "Run Recipe",
+    #         f"Run recipe '{self.current_recipe.name}'?\n\n"
+    #         f"Steps: {len(self.current_recipe.steps)}\n"
+    #         f"Estimated duration: {total_duration_str}\n\n"
+    #         f"You can use Emergency Stop if needed.",
+    #         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+    #     )
+        
+    #     if reply != QMessageBox.StandardButton.Yes:
+    #         return
+        
+    #     self.recipe_running = True
+    #     self.operation_in_progress = True
+    #     self.run_recipe_btn.setEnabled(False)
+    #     self.recipe_total_steps = len(self.current_recipe.steps)
+        
+    #     self.job_total_duration = total_duration_ms + 3000
+    #     self.job_start_time = datetime.now()
+    #     self.progress_bar.setValue(0)
+    #     self.job_timer.start(100)
+        
+    #     try:
+    #         for i, step in enumerate(self.current_recipe.steps, 1):
+    #             self.recipe_step_index = i
+    #             self.recipe_step_label.setText(f"{i}/{self.recipe_total_steps}")
+    #             self.log_text.append(f"[RECIPE] Step {i}/{self.recipe_total_steps}: {step['type']}")
+                
+    #             if step['type'] == 'valve':
+    #                 # Clear the event before sending so we wait for THIS command's completion
+    #                 self.valve_done_event.clear()
+    #                 self.valve_job_running = True
+                    
+    #                 await self.controller.valve(
+    #                     step['valve_id'],
+    #                     step['num_pulses'],
+    #                     step['pulse_time'],
+    #                     step['purge_time']
+    #                 )
+    #                 self.log_text.append(f"[RECIPE] Valve command sent, waiting for completion...")
+                    
+    #                 # Wait for completion signal with a generous timeout
+    #                 valve_duration_sec = self.calculate_valve_duration(
+    #                     step['num_pulses'], step['pulse_time'], step['purge_time']
+    #                 ) / 1000
+    #                 timeout_sec = valve_duration_sec + 30  # 30s grace period
+                    
+    #                 elapsed = 0.0
+    #                 poll_interval = 0.25  # seconds
+    #                 while not self.valve_done_event.is_set():
+    #                     await asyncio.sleep(poll_interval)
+    #                     elapsed += poll_interval
+    #                     if elapsed >= timeout_sec:
+    #                         raise Exception(
+    #                             f"Valve step {i} timed out after {timeout_sec:.0f}s "
+    #                             f"(expected ~{valve_duration_sec:.0f}s)"
+    #                         )
+    #                 self.log_text.append(f"[RECIPE] Valve step complete")
+                
+    #             elif step['type'] == 'temp':
+    #                 await self.controller.temp(
+    #                     step['tc2'], step['tc3'], step['tc4'], step['tc5']
+    #                 )
+    #                 self.temp_setpoints = {
+    #                     'tc2': step['tc2'], 'tc3': step['tc3'],
+    #                     'tc4': step['tc4'], 'tc5': step['tc5']
+    #                 }
+    #                 self.temp_setpoints_initialized = True
+    #                 self.tc2_setpoint_display.setText(f"→ {step['tc2']}°C")
+    #                 self.tc3_setpoint_display.setText(f"→ {step['tc3']}°C")
+    #                 self.tc4_setpoint_display.setText(f"→ {step['tc4']}°C")
+    #                 self.tc5_setpoint_display.setText(f"→ {step['tc5']}°C")
+    #                 self.log_text.append(f"[RECIPE] Temperature step complete")
+                
+    #             elif step['type'] == 'wait':
+    #                 self.log_text.append(f"[RECIPE] Waiting {step['duration']}s...")
+    #                 # Yield to Qt event loop in small chunks so UI stays responsive
+    #                 remaining = step['duration']
+    #                 while remaining > 0:
+    #                     chunk = min(remaining, 1)
+    #                     await asyncio.sleep(chunk)
+    #                     remaining -= chunk
+    #                     # Update time remaining display during wait
+    #                     self.time_remaining_label.setText(f"{remaining}s remaining (wait)")
+    #                 self.log_text.append(f"[RECIPE] Wait complete")
+            
+    #         self.log_text.append(f"[RECIPE] '{self.current_recipe.name}' completed successfully!")
+    #         self.recipe_step_label.setText("Complete")
+    #         QMessageBox.information(self, "Recipe Complete", "Recipe executed successfully!")
+        
+    #     except Exception as e:
+    #         self.log_text.append(f"[RECIPE] Error at step {self.recipe_step_index}: {e}")
+    #         QMessageBox.critical(self, "Recipe Failed", f"Recipe failed at step {self.recipe_step_index}:\n\n{e}")
+        
+    #     finally:
+    #         self.recipe_running = False
+    #         self.operation_in_progress = False
+    #         self.valve_job_running = False
+    #         self.run_recipe_btn.setEnabled(True)
+    #         self.job_timer.stop()
+    #         self.progress_bar.setValue(100)
+    #         self.time_remaining_label.setText("Complete")
 def main():
     app = QApplication(sys.argv)
     
