@@ -26,9 +26,13 @@ class ALDMainWindow(QMainWindow):
         # Temperature setpoints for safety monitoring
         self.temp_setpoints = {'tc2': 25, 'tc3': 30, 'tc4': 35, 'tc5': 40}
         self.temp_setpoints_initialized = False  
-        self.data_log_file = None
-        self.data_log_writer = None
-        self.data_log_filename = None
+        self.temp_log_file = None
+        self.temp_log_writer = None
+        self.temp_log_filename = None
+        self.pressure_log_file = None
+        self.pressure_log_writer = None
+        self.pressure_log_filename = None
+        self.pressure_log_counter = 0
         # Temperature data storage
         self.temp_data = {
             'tc2': deque(maxlen=2000),
@@ -40,15 +44,15 @@ class ALDMainWindow(QMainWindow):
         }
         # Pressure and flow data storage
         self.pressure_data = {
-            'value': deque(maxlen=2000),
-            'unit': deque(maxlen=2000),
-            'time': deque(maxlen=2000),
-            'timestamp': deque(maxlen=2000)
+            'value': deque(maxlen=20000),
+            'unit': deque(maxlen=20000),
+            'time': deque(maxlen=20000),
+            'timestamp': deque(maxlen=20000)
         }
         self.flow_data = {
-            'value': deque(maxlen=2000),
-            'time': deque(maxlen=2000),
-            'timestamp': deque(maxlen=2000)
+            'value': deque(maxlen=20000),
+            'time': deque(maxlen=20000),
+            'timestamp': deque(maxlen=20000)
         }
         self.time_counter = 0
         self.start_time = None
@@ -134,30 +138,25 @@ class ALDMainWindow(QMainWindow):
                     self.graph_update_pending = True
 
                     # Write to continuous log (pressure/flow use latest known values)
-                    if self.data_log_writer is not None:
+                    # Write to temp log
+                    if self.temp_log_writer is not None:
                         time_sec = (now - self.start_time).total_seconds()
-                        pressure_val = self.pressure_data['value'][-1] if self.pressure_data['value'] else ''
-                        flow_val = self.flow_data['value'][-1] if self.flow_data['value'] else ''
-                        self.data_log_writer.writerow([
+                        self.temp_log_writer.writerow([
                             now.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
-                            f"{time_sec:.1f}",
-                            tc2_val, tc3_val, tc4_val, tc5_val,
-                            f"{pressure_val:.2f}" if pressure_val != '' else '',
-                            f"{flow_val:.2f}" if flow_val != '' else ''
+                            f"{time_sec:.2f}",
+                            tc2_val, tc3_val, tc4_val, tc5_val
                         ])
-                        # Flush every 60 samples (~1 min) to avoid OS buffering data loss
                         if self.time_counter % 60 == 0:
-                            self.data_log_file.flush()
-
+                            self.temp_log_file.flush()
                     self.check_temperature_safety(tc2_val, tc3_val, tc4_val, tc5_val)
 
             except (ValueError, IndexError):
                 pass
-    
+                        
     def check_temperature_safety(self, tc2, tc3, tc4, tc5):
+        """Check if any temperature exceeds setpoint by more than 50°C"""
         if not self.temp_setpoints_initialized:
             return
-        """Check if any temperature exceeds setpoint by more than 50°C"""
         overheat_elements = []
         
         if tc2 > self.temp_setpoints['tc2'] + 50:
@@ -216,10 +215,28 @@ class ALDMainWindow(QMainWindow):
                     self.pressure_data['value'].append(value)
                     self.pressure_data['unit'].append(unit)
                     self.pressure_data['time'].append(self.time_counter)
-                    self.pressure_data['timestamp'].append(datetime.now())
+                    now = datetime.now()
+                    if self.start_time is None:  
+                        self.start_time = now
+                    self.pressure_data['timestamp'].append(now)
+                    self.graph_update_pending = True  
+                    # Write to pressure log
+                    if self.pressure_log_writer is not None and self.start_time is not None:
+                        time_sec = (now - self.start_time).total_seconds()
+                        flow_val = self.flow_data['value'][-1] if self.flow_data['value'] else ''
+                        self.pressure_log_writer.writerow([
+                            now.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
+                            f"{time_sec:.2f}",
+                            f"{value:.4f}",
+                            unit,
+                            f"{flow_val:.3f}" if flow_val != '' else ''
+                        ])
+                        # flush every 60 pressure samples (~3s at 20Hz)
+                        self.pressure_log_counter += 1
+                        if self.pressure_log_counter % 60 == 0:
+                            self.pressure_log_file.flush()
             except (ValueError, IndexError):
                 pass
-
     def parse_flow_data(self, msg):
         """Parse flow data from Arduino messages"""
         if msg.upper().startswith('F:'):
@@ -1399,30 +1416,50 @@ class ALDMainWindow(QMainWindow):
             except Exception as e:
                 QMessageBox.critical(self, "Export Failed", f"Could not export log:\n{e}")
     def start_data_logging(self):
-        """Open a CSV file for continuous data logging"""
-        self.data_log_filename = f"ald_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        self.data_log_file = open(self.data_log_filename, 'w', newline='')
-        self.data_log_writer = csv.writer(self.data_log_file)
-        self.data_log_writer.writerow([
-            'Timestamp', 'Time_s', 'TC2_C', 'TC3_C', 'TC4_C', 'TC5_C', 'Pressure_mTorr', 'Flow_ms'
+        """Open separate CSV files for temp and pressure logging"""
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        
+        self.temp_log_filename = f"ald_temp_{timestamp}.csv"
+        self.temp_log_file = open(self.temp_log_filename, 'w', newline='')
+        self.temp_log_writer = csv.writer(self.temp_log_file)
+        self.temp_log_writer.writerow([
+            'Timestamp', 'Time_s', 'TC2_C', 'TC3_C', 'TC4_C', 'TC5_C'
         ])
-        self.log_text.append(f"[LOG] Data logging started: {self.data_log_filename}")
+
+        self.pressure_log_filename = f"ald_pressure_{timestamp}.csv"
+        self.pressure_log_file = open(self.pressure_log_filename, 'w', newline='')
+        self.pressure_log_writer = csv.writer(self.pressure_log_file)
+        self.pressure_log_writer.writerow([
+            'Timestamp', 'Time_s', 'Pressure', 'Unit', 'Flow_ms'
+        ])
+
+        self.log_text.append(f"[LOG] Temp log: {self.temp_log_filename}")
+        self.log_text.append(f"[LOG] Pressure log: {self.pressure_log_filename}")
 
     def stop_data_logging(self):
-        """Close the CSV log file"""
-        if self.data_log_file is not None:
-            self.data_log_file.flush()
-            self.data_log_file.close()
-            self.data_log_file = None
-            self.data_log_writer = None
-            self.log_text.append(f"[LOG] Data logging stopped: {self.data_log_filename}")
+        """Close both CSV log files"""
+        if self.temp_log_file is not None:
+            self.temp_log_file.flush()
+            self.temp_log_file.close()
+            self.temp_log_file = None
+            self.temp_log_writer = None
+            self.log_text.append(f"[LOG] Temp log closed: {self.temp_log_filename}")
+
+        if self.pressure_log_file is not None:
+            self.pressure_log_file.flush()
+            self.pressure_log_file.close()
+            self.pressure_log_file = None
+            self.pressure_log_writer = None
+            self.log_text.append(f"[LOG] Pressure log closed: {self.pressure_log_filename}")
     def export_temperature_data(self):
-        if self.data_log_filename:
+        if self.temp_log_filename or self.pressure_log_filename:
             QMessageBox.information(
                 self,
                 "Data Log Location",
-                f"Data is being continuously logged to:\n\n{self.data_log_filename}\n\n"
-                f"The file is updated every ~60 seconds and is safe to copy while running."
+                f"Data is being continuously logged to:\n\n"
+                f"Temperature: {self.temp_log_filename or 'not started'}\n"
+                f"Pressure:    {self.pressure_log_filename or 'not started'}\n\n"
+                f"Both files share the same timestamp prefix and are safe to copy while running."
             )
         else:
             QMessageBox.warning(self, "No Log Active", "Connect to Arduino to start data logging.")
@@ -1632,11 +1669,17 @@ class ALDMainWindow(QMainWindow):
             if stable_count >= required_count:
                 return True
 
+        tc2 = self.temp_data['tc2'][-1] if self.temp_data['tc2'] else float('nan')
+        tc3 = self.temp_data['tc3'][-1] if self.temp_data['tc3'] else float('nan')
+        tc4 = self.temp_data['tc4'][-1] if self.temp_data['tc4'] else float('nan')
+        tc5 = self.temp_data['tc5'][-1] if self.temp_data['tc5'] else float('nan')
+
         raise Exception(
             f"Temperature stabilization timed out after {timeout_seconds}s. "
             f"Last readings: TC2:{tc2:.1f} TC3:{tc3:.1f} TC4:{tc4:.1f} TC5:{tc5:.1f} "
             f"Setpoints: {tc2_sp}/{tc3_sp}/{tc4_sp}/{tc5_sp}"
         )
+        
 
     @asyncSlot()
     async def run_recipe(self):
@@ -1875,6 +1918,10 @@ class ALDMainWindow(QMainWindow):
     #         self.job_timer.stop()
     #         self.progress_bar.setValue(100)
     #         self.time_remaining_label.setText("Complete")
+    def closeEvent(self, event):
+        self.stop_data_logging()
+        event.accept()
+
 def main():
     app = QApplication(sys.argv)
     

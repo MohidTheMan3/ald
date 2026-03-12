@@ -52,16 +52,16 @@ const double D6FW04A1_LUT[5] = {1.00,1.58,2.88,4.11,5.00};   // from datasheet; 
 
 int32_t rawData = 0;
 
-const int num_samples_pgauge = 200;
-const int num_samples_flow_sense = 100;
+const int num_samples_pgauge = 10;
+const int num_samples_flow_sense = 10;
 
 unsigned long lastTempSend = 0;
 unsigned long lastPressureSend = 0;
 unsigned long lastFlowSend = 0;
 
 const unsigned long TEMP_INTERVAL_MS = 500;      // 2Hz - respects MAX31855 limits
-const unsigned long PRESSURE_INTERVAL_MS = 200;  // 5Hz
-const unsigned long FLOW_INTERVAL_MS = 500;      // 2Hz
+const unsigned long PRESSURE_INTERVAL_MS = 50;  // 20Hz
+const unsigned long FLOW_INTERVAL_MS = 1000;      // 2Hz
 
 const int num_samples = 10;
 double tc1_readings[num_samples];
@@ -125,7 +125,7 @@ void setup()
   if (DO_NOTHING)
     while(1);
 
-  Serial.begin(9600);
+  Serial.begin(115200);
 
   // relay pins
   pinMode(RELAY1_PIN, OUTPUT);
@@ -153,7 +153,7 @@ void setup()
   for (int i=0;i<7;i++)
     thermocouples[i].begin();
 
-  Serial.begin(9600);
+  Serial.begin(115200);
   while (!Serial)
     Serial.println("Waiting for serial...");
 

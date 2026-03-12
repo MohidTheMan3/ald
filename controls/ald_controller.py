@@ -37,7 +37,7 @@ class ALDController:
         
         return logger
     
-    async def connect(self, port="COM3", baudrate=9600):
+    async def connect(self, port="COM3", baudrate=115200):
         try:
             self.logger.info(f"Connecting to {port}...")
             
