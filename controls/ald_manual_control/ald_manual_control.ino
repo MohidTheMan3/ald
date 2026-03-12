@@ -369,7 +369,72 @@ void loop()
   // serial command parsing - unchanged
   if (Serial.available() > 0)
   {
-    // ... all your existing command parsing code unchanged ...
+    Serial.println("Got command!");
+    char s[100] = {0};
+    String inputString = Serial.readStringUntil('\n'); // Read until newline character
+    strcpy(s, inputString.c_str());
+    
+    // s = "s";              // STOP command: exit loop 
+    // s = "r";              // RESET command: reset pulse counter 
+    // s = "t100;200;150;90";  // example temp. command
+    // s = "v2;5;1000;3000";   // example valve command
+
+    Serial.println(s);
+    int result = 0;
+
+    // stop command
+    if (s[0] == 's')
+    {
+      Serial.println("EMERGENCY STOP command received! Closing all valves, Stopping heating! Shutdown");
+      digitalWrite(RELAY1_PIN, HIGH);
+      digitalWrite(RELAY2_PIN, HIGH);
+      digitalWrite(RELAY3_PIN, HIGH);
+      digitalWrite(RELAY4_PIN, HIGH);
+      digitalWrite(RELAY6_PIN, LOW);
+      digitalWrite(RELAY7_PIN, LOW);
+      digitalWrite(RELAY8_PIN, LOW);  // Active HIGH MOSFET
+      while(1){
+        // do nothing - EMERGENCY STOP state
+        // need to restart program to recover from this state
+      }
+    }
+    // reset command
+    else if (s[0] == 'r')
+    {
+      num_pulse = 0;
+      which_valve = 0;
+      Serial.println("RESET command received! Resetting state!");
+    } else
+    {
+      // temperature command
+      if (s[0] == 't')
+      {
+        tc_active = 1;
+        result = sscanf(s, "t%d;%d;%d;%d", &temp_sp2, &temp_sp3, &temp_sp4, &temp_sp5);
+      } else if (s[0] == 'v') // ALD valve command
+      {
+        if (busy) Serial.println("COMMAND IGNORED. Wait for previous command to finish, or issue RESET.");
+        else
+        {
+          busy = true;
+          result = sscanf(s, "v%u;%u;%u;%u", &which_valve, &num_pulse, &pulse_time, &purge_time);    
+        }
+      } else
+      {
+        Serial.println("INVALID COMMAND!");
+        return;
+      }
+
+      // unable to parse command-line input properly
+      if (result != 4)
+      {
+        Serial.println("MISFORMATTED COMMAND! sscanf result: ");
+        Serial.println(result);
+        return;
+      } else {
+        Serial.println("Starting command!");
+      }
+    }
   }
   
   // valve actuation - runs every loop iteration (it's already fast)
