@@ -37,7 +37,7 @@ class ALDController:
         
         return logger
     
-    async def connect(self, port="COM3", baudrate=115200):
+    async def connect(self, port="COM5", baudrate=115200):
         try:
             self.logger.info(f"Connecting to {port}...")
             
@@ -95,19 +95,16 @@ class ALDController:
     async def send(self, data):
         if not self.connected:
             raise RuntimeError("Not connected")
-        
-        async with self._lock:
-            try:
-                if not data.endswith('\n'):
-                    data += '\n'
-                
-                self.writer.write(data.encode())
-                await self.writer.drain()
-                self.logger.info(f"Sent: {data.strip()}")
-                
-            except Exception as e:
-                self.logger.error(f"Send failed: {e}")
-                raise
+        try:
+            if not data.endswith('\n'):
+                data += '\n'
+            
+            self.writer.write(data.encode())
+            self.logger.info(f"Sent: {data.strip()}")
+            
+        except Exception as e:
+            self.logger.error(f"Send failed: {e}")
+            raise
     
     async def read_line(self):
         if not self.connected:
@@ -115,7 +112,7 @@ class ALDController:
         
         try:
             data = await asyncio.wait_for(self.reader.readline(), timeout=0.1)
-            msg = data.decode().strip()
+            msg = data.decode('utf-8', errors='ignore').strip()
             
             if msg:
                 self.logger.info(f"Received: {msg}")
@@ -133,47 +130,39 @@ class ALDController:
         """Read serial data continuously and queue messages for processing"""
         while self.connected:
             try:
-                # Don't hold lock while reading - just read and queue
-                if self.reader:
-                    try:
-                        data = await asyncio.wait_for(self.reader.readline(), timeout=0.1)
-                        msg = data.decode().strip()
-                        
-                        if msg:
-                            self.logger.info(f"Received: {msg}")
-                            # Put message in queue instead of calling callback directly
-                            await self._message_queue.put(msg)
-                            
-                    except asyncio.TimeoutError:
-                        pass  # No data available, that's fine
-                        
+                if self.reader and self.reader._transport:
+                    # Use a short sleep instead of wait_for to avoid re-entrancy
+                    if self.reader._buffer:
+                        try:
+                            data = await self.reader.readline()
+                            msg = data.decode('utf-8', errors='ignore').strip()
+                            if msg:
+                                self.logger.info(f"Received: {msg}")
+                                self._message_queue.put_nowait(msg)
+                        except Exception:
+                            pass
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 if self.connected:
                     self.logger.error(f"Read error: {e}")
                 break
-            
             await asyncio.sleep(0.01)
     
     async def _process_messages(self):
         """Process queued messages by calling the callback"""
         while self.connected:
             try:
-                # Wait for a message with timeout
                 try:
-                    msg = await asyncio.wait_for(self._message_queue.get(), timeout=0.1)
+                    msg = self._message_queue.get_nowait()
                     if msg and self.message_callback:
-                        # Call callback synchronously (it should not be async)
                         self.message_callback(msg)
-                except asyncio.TimeoutError:
+                except asyncio.QueueEmpty:
                     pass
-                    
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 self.logger.error(f"Message processing error: {e}")
-            
             await asyncio.sleep(0.001)
     
     def set_callback(self, callback):
