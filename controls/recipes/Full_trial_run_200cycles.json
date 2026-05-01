@@ -1,0 +1,37 @@
+{
+  "name": "Full_trial_run_200cycles",
+  "description": "",
+  "created": "2026-04-17T14:03:21.860833",
+  "cycles": 200,
+  "steps": [
+    {
+      "type": "temp",
+      "tc2": 150,
+      "tc3": 89,
+      "tc4": 23,
+      "tc5": 200
+    },
+    {
+      "type": "valve",
+      "valve_id": 3,
+      "num_pulses": 1,
+      "pulse_time": 350,
+      "purge_time": 25000
+    },
+    {
+      "type": "wait",
+      "duration": 1
+    },
+    {
+      "type": "valve",
+      "valve_id": 1,
+      "num_pulses": 1,
+      "pulse_time": 100,
+      "purge_time": 20000
+    },
+    {
+      "type": "wait",
+      "duration": 1
+    }
+  ]
+}

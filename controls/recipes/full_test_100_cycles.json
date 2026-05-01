@@ -1,0 +1,33 @@
+{
+  "name": "full_test_100_cycles",
+  "description": "",
+  "created": "2026-04-06T15:48:42.271682",
+  "cycles": 100,
+  "steps": [
+    {
+      "type": "temp",
+      "tc2": 130,
+      "tc3": 75,
+      "tc4": 75,
+      "tc5": 200
+    },
+    {
+      "type": "valve",
+      "valve_id": 1,
+      "num_pulses": 1,
+      "pulse_time": 100,
+      "purge_time": 4000
+    },
+    {
+      "type": "wait",
+      "duration": 1
+    },
+    {
+      "type": "valve",
+      "valve_id": 2,
+      "num_pulses": 1,
+      "pulse_time": 100,
+      "purge_time": 4000
+    }
+  ]
+}
