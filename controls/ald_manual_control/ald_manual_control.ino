@@ -10,6 +10,20 @@
 // CMU Hacker Fab 2025
 // Joel Gonzalez, Haewon Uhm, Atharva Raut
 // Updated 2025-Dec-05
+//
+// Serial command protocol:
+//   t<delivery_C>;<prec1_C>;<prec2_C>;<substrate_C>
+//     Update heater setpoints and enable temperature control.
+//   v<valve_id>;<num_pulses>;<pulse_ms>;<purge_ms>
+//     Pulse one valve for the requested number of pulse/purge cycles.
+//   r
+//     Reset valve command state.
+//   s
+//     Emergency stop: turn heaters off, close valves, then halt.
+//
+// Relay convention used throughout this file:
+//   Heater relays are active LOW: LOW = ON, HIGH = OFF.
+//   Valve relays are driven HIGH during pulse/open and LOW during purge/closed.
 
 // ============================================================
 // PIN ALLOCATION
@@ -73,8 +87,8 @@ Adafruit_MAX31855 thermocouples[4] = {
 int32_t rawData = 0;
 
 // -------------------- Sampling / timing --------------------
-const int num_samples_pgauge = 200;
-int active_pgauge_samples = 200;  // matches num_samples_pgauge default
+const int num_samples_pgauge = 40;
+int active_pgauge_samples = 40;  // matches num_samples_pgauge default
 const int num_samples_flow_sense = 10;
 const int num_temp_samples = 8;
 
@@ -83,7 +97,7 @@ unsigned long lastPressureSend = 0;
 unsigned long lastFlowSend = 0;
 
 const unsigned long TEMP_INTERVAL_MS = 500;
-const unsigned long PRESSURE_INTERVAL_MS = 50;
+const unsigned long PRESSURE_INTERVAL_MS = 500;
 const unsigned long FLOW_INTERVAL_MS = 1000;
 
 // -------------------- Thermocouple buffers -----------------
@@ -109,6 +123,12 @@ int temp_set_delivery  = 0;
 int temp_set_prec1     = 0;
 int temp_set_prec2     = 0;
 int temp_set_substrate = 0;
+
+// Used to detect setpoint changes and reset precursor startup/pulse state.
+// Without this, a small setpoint increase such as 83 C -> 88 C can leave
+// the precursor controller stuck in its old steady/startup state.
+int last_temp_set_prec1 = -999;
+int last_temp_set_prec2 = -999;
 
 int tc_active = 0;
 
@@ -175,7 +195,7 @@ unsigned long prec2_last_pulse_end_ms = 0;
 unsigned long prec2_current_pulse_on_ms = 700;
 
 const unsigned long prec2_startup_min_off_ms = 6000;
-const unsigned long prec2_pulse_cooldown_ms = 4000;
+const unsigned long prec2_pulse_cooldown_ms = 1500;
 
 // ============================================================
 // Delivery line custom trend-based control state
@@ -189,8 +209,6 @@ const unsigned long delivery_lockout_ms = 1500;
 int delivery_falling_count = 0;
 const int DELIVERY_TREND_CONFIRM = 1;
 const float delivery_trend_epsilon = 0.15;
-
-
 
 // ============================================================
 // Substrate custom trend-based control state
@@ -264,7 +282,6 @@ void readThermocouples()
     if (!isnan(curr_val))
       current_reading[i] = curr_val;
   }
-  
 
   // Consistent physical mapping:
   // pin 3 -> substrate
@@ -306,6 +323,49 @@ void readThermocouples()
   );
 }
 
+// ============================================================
+// Reset all per-precursor controller state after a setpoint change
+// ============================================================
+void resetPrecursorControlState(
+    bool &relay_on,
+    bool &startup_mode,
+    bool &startup_pulse_stage,
+    bool &peak_seen,
+    bool &temp_rising,
+    bool &pulse_mode,
+    bool &force_recovery_mode,
+    float &peak_temp,
+    unsigned long &last_switch_ms,
+    unsigned long &pulse_start_ms,
+    unsigned long &last_pulse_end_ms,
+    unsigned long &current_pulse_on_ms,
+    const int relay_pin)
+{
+  // Active LOW relay: HIGH = OFF
+  digitalWrite(relay_pin, HIGH);
+  relay_on = false;
+
+  startup_mode = true;
+  startup_pulse_stage = false;
+  peak_seen = false;
+  temp_rising = false;
+  pulse_mode = false;
+  force_recovery_mode = false;
+
+  peak_temp = -999.0;
+  last_switch_ms = millis();
+  pulse_start_ms = 0;
+  last_pulse_end_ms = millis();
+  current_pulse_on_ms = 700;
+}
+
+// ============================================================
+// Shared precursor heater controller
+//
+// Both precursor heaters use this same startup, pulse, and recovery
+// logic. Each precursor passes in its own state variables by reference,
+// so the two channels remain independent while sharing identical logic.
+// ============================================================
 void controlPrecursorHeater(
     double temp_avg,
     double prev_temp_avg,
@@ -326,21 +386,54 @@ void controlPrecursorHeater(
     const unsigned long pulse_cooldown_ms,
     const int relay_pin)
 {
-  float error = temp_set - temp_avg;
+  // Same control logic/tuning is used for BOTH precursor heaters.
+  // Relay convention: LOW = ON, HIGH = OFF.
   bool can_switch = (millis() - last_switch_ms) >= 2000;
 
   bool prev_temp_rising = temp_rising;
-  const float trend_eps = 0.06;   // smaller due to insulation
+  const float trend_eps = 0.04;
 
   if (temp_avg > prev_temp_avg + trend_eps) temp_rising = true;
   else if (temp_avg < prev_temp_avg - trend_eps) temp_rising = false;
 
   if (temp_avg > peak_temp) peak_temp = temp_avg;
 
+  // -------------------- Shared precursor tuning --------------------
+  // Last-resort recovery: only used after startup if the temp drops too low.
+  float recovery_on_threshold   = temp_set - 2.5;
+  float recovery_off_threshold  = temp_set - 1.0;
+
+  // Startup bulk stage: full ON only when far below setpoint.
+  float bulk_on_threshold       = temp_set - 8.0;
+  float bulk_to_pulse_threshold = temp_set - 3.0;
+
+  // Startup pulse stage: small pulses near the target to avoid overshoot.
+  float startup_pulse_on_threshold = temp_set - 2.0;
+  float startup_sufficiently_low   = temp_set - 2.5;
+  float startup_cutoff_threshold   = temp_set - 0.4;
+  float startup_exit_threshold     = temp_set - 0.3;
+
+  // Normal steady-state pulse control.
+  float steady_on_threshold        = temp_set - 0.8;
+  float steady_sufficiently_low    = temp_set - 1.2;
+  float steady_cutoff_threshold    = temp_set - 0.2;
+
+  unsigned long startup_cooldown   = 1200;
+  unsigned long steady_cooldown    = 1200;
+
+  // If setpoint is zero or invalid, keep heater off and reset state.
+  if (temp_set <= 0) {
+    digitalWrite(relay_pin, HIGH);
+    relay_on = false;
+    pulse_mode = false;
+    force_recovery_mode = false;
+    return;
+  }
+
   // ==================================================
   // LAST-RESORT RECOVERY MODE
   // ==================================================
-  if (!startup_mode && !pulse_mode && temp_avg <= temp_set - 4.0) {
+  if (!startup_mode && !pulse_mode && temp_avg <= recovery_on_threshold) {
     force_recovery_mode = true;
   }
 
@@ -352,8 +445,7 @@ void controlPrecursorHeater(
       last_switch_ms = millis();
     }
 
-    // exit recovery quickly so pulse control resumes
-    if (temp_avg >= temp_set - 3.0) {
+    if (temp_avg >= recovery_off_threshold) {
       digitalWrite(relay_pin, HIGH);  // OFF
       relay_on = false;
       pulse_mode = false;
@@ -366,9 +458,7 @@ void controlPrecursorHeater(
   }
 
   // ==================================================
-  // STARTUP MODE: TWO STAGE
-  // Stage 1 = bulk heating
-  // Stage 2 = startup pulsing
+  // STARTUP MODE
   // ==================================================
   if (startup_mode) {
 
@@ -376,18 +466,24 @@ void controlPrecursorHeater(
     // STAGE 1: bulk heating
     // -------------------------
     if (!startup_pulse_stage) {
-      float bulk_to_pulse_threshold = temp_set - 12.0;
 
-      // full ON while far from setpoint
+      // Important fix for small setpoint increases, e.g. 83 C -> 88 C:
+      // If the current temp is already close enough that full bulk heating
+      // is not appropriate, skip directly into startup pulse mode.
+      if (!relay_on && temp_avg > bulk_on_threshold) {
+        startup_pulse_stage = true;
+        last_pulse_end_ms = millis();
+        return;
+      }
+
       if (!relay_on) {
-        if (can_switch && temp_avg <= temp_set - 20.0) {
+        if (can_switch && temp_avg <= bulk_on_threshold) {
           digitalWrite(relay_pin, LOW);   // ON
           relay_on = true;
           last_switch_ms = millis();
         }
       }
 
-      // shut OFF earlier and switch to startup pulse stage
       if (relay_on && can_switch && temp_avg >= bulk_to_pulse_threshold) {
         digitalWrite(relay_pin, HIGH);    // OFF
         relay_on = false;
@@ -402,9 +498,6 @@ void controlPrecursorHeater(
     // -------------------------
     // STAGE 2: startup pulsing
     // -------------------------
-    float startup_pulse_on_threshold = temp_set - 8.0;
-
-    // end startup pulse
     if (pulse_mode && relay_on) {
       if ((millis() - pulse_start_ms) >= current_pulse_on_ms) {
         digitalWrite(relay_pin, HIGH);   // OFF
@@ -415,12 +508,11 @@ void controlPrecursorHeater(
       }
     }
 
-    // start startup pulse
     if (!relay_on && !pulse_mode) {
       bool cooldown_done =
-          (millis() - last_pulse_end_ms) >= 2500;
+          (millis() - last_pulse_end_ms) >= startup_cooldown;
 
-      bool sufficiently_low = temp_avg <= temp_set - 9.0;
+      bool sufficiently_low = temp_avg <= startup_sufficiently_low;
 
       if (cooldown_done &&
           temp_avg <= startup_pulse_on_threshold &&
@@ -428,12 +520,10 @@ void controlPrecursorHeater(
 
         float drop_deg = temp_set - temp_avg;
 
-        // shorter startup pulses to limit overshoot
         current_pulse_on_ms =
-            700 + (unsigned long)(250.0 * (drop_deg - 6.0));
-
-        if (current_pulse_on_ms < 700) current_pulse_on_ms = 700;
-        if (current_pulse_on_ms > 1600) current_pulse_on_ms = 1600;
+            850 + (unsigned long)(250.0 * drop_deg);
+        if (current_pulse_on_ms < 850) current_pulse_on_ms = 850;
+        if (current_pulse_on_ms > 1700) current_pulse_on_ms = 1700;
 
         digitalWrite(relay_pin, LOW);   // ON
         relay_on = true;
@@ -443,11 +533,10 @@ void controlPrecursorHeater(
       }
     }
 
-    // cut startup pulse early near setpoint
     if (relay_on &&
         pulse_mode &&
         temp_rising &&
-        temp_avg >= temp_set - 4.0) {
+        temp_avg >= startup_cutoff_threshold) {
       digitalWrite(relay_pin, HIGH);   // OFF
       relay_on = false;
       pulse_mode = false;
@@ -455,11 +544,10 @@ void controlPrecursorHeater(
       last_pulse_end_ms = millis();
     }
 
-    // exit startup after first peak near target
     if (!relay_on &&
         prev_temp_rising &&
         !temp_rising &&
-        temp_avg >= temp_set - 2.0) {
+        temp_avg >= startup_exit_threshold) {
       startup_mode = false;
       startup_pulse_stage = false;
       peak_seen = true;
@@ -474,9 +562,6 @@ void controlPrecursorHeater(
   // ==================================================
   // NORMAL STEADY PULSE CONTROL
   // ==================================================
-  float on_threshold = temp_set - 0.8;
-
-  // end active timed pulse
   if (pulse_mode && relay_on) {
     if ((millis() - pulse_start_ms) >= current_pulse_on_ms) {
       digitalWrite(relay_pin, HIGH);   // OFF
@@ -487,24 +572,22 @@ void controlPrecursorHeater(
     }
   }
 
-  // start new timed pulse
   if (!relay_on && !pulse_mode) {
     bool cooldown_done =
-        (millis() - last_pulse_end_ms) >= pulse_cooldown_ms;
+        (millis() - last_pulse_end_ms) >= steady_cooldown;
 
-    bool sufficiently_low = temp_avg <= temp_set - 1.5;
+    bool sufficiently_low = temp_avg <= steady_sufficiently_low;
 
     if (cooldown_done &&
-        temp_avg <= on_threshold &&
+        temp_avg <= steady_on_threshold &&
         (!temp_rising || sufficiently_low)) {
 
       float drop_deg = temp_set - temp_avg;
 
       current_pulse_on_ms =
-          1000 + (unsigned long)(500.0 * (drop_deg - 1.0));
-
-      if (current_pulse_on_ms < 1000) current_pulse_on_ms = 1000;
-      if (current_pulse_on_ms > 3200) current_pulse_on_ms = 3200;
+          700 + (unsigned long)(350.0 * drop_deg);
+      if (current_pulse_on_ms < 700) current_pulse_on_ms = 700;
+      if (current_pulse_on_ms > 1800) current_pulse_on_ms = 1800;
 
       digitalWrite(relay_pin, LOW);   // ON
       relay_on = true;
@@ -514,11 +597,10 @@ void controlPrecursorHeater(
     }
   }
 
-  // shut off pulse near target
   if (relay_on &&
       pulse_mode &&
-      temp_avg >= temp_set - 2.2 &&
-      temp_rising) {
+      temp_rising &&
+      temp_avg >= steady_cutoff_threshold) {
     digitalWrite(relay_pin, HIGH);   // OFF
     relay_on = false;
     pulse_mode = false;
@@ -541,18 +623,18 @@ void actuateHeatingElements()
 
   bool delivery_can_switch =
       (millis() - delivery_last_switch_ms) >= delivery_lockout_ms;
-  Serial.print("DELIV set=");
-  Serial.print(temp_set_delivery);
-  Serial.print(" avg=");
-  Serial.print(temp_delivery_avg);
-  Serial.print(" rising=");
-  Serial.print(delivery_temp_rising ? "Y" : "N");
-  Serial.print(" armed=");
-  Serial.print(delivery_restart_armed ? "Y" : "N");
-  Serial.print(" fallCt=");
-  Serial.print(delivery_falling_count);
-  Serial.print(" relay=");
-  Serial.println(relay_delivery_on ? "ON" : "OFF");
+  // Serial.print("DELIV set=");
+  // Serial.print(temp_set_delivery);
+  // Serial.print(" avg=");
+  // Serial.print(temp_delivery_avg);
+  // Serial.print(" rising=");
+  // Serial.print(delivery_temp_rising ? "Y" : "N");
+  // Serial.print(" armed=");
+  // Serial.print(delivery_restart_armed ? "Y" : "N");
+  // Serial.print(" fallCt=");
+  // Serial.print(delivery_falling_count);
+  // Serial.print(" relay=");
+  // Serial.println(relay_delivery_on ? "ON" : "OFF");
   if (relay_delivery_on)
   {
       // Turn off early on the way up
@@ -601,7 +683,7 @@ void actuateHeatingElements()
 
   prev_temp_delivery_avg = temp_delivery_avg;
 
-    controlPrecursorHeater(
+  controlPrecursorHeater(
       temp_prec1_avg,
       prev_temp_prec1_avg,
       temp_set_prec1,
@@ -623,7 +705,7 @@ void actuateHeatingElements()
   );
   prev_temp_prec1_avg = temp_prec1_avg;
 
-    controlPrecursorHeater(
+  controlPrecursorHeater(
       temp_prec2_avg,
       prev_temp_prec2_avg,
       temp_set_prec2,
@@ -644,70 +726,39 @@ void actuateHeatingElements()
       RELAY_PREC2_PIN
   );
   prev_temp_prec2_avg = temp_prec2_avg;
-  // ----------------------------------------------------------
-  // Substrate heater: trend-based control
-  // ----------------------------------------------------------
-  float substrate_off_threshold = temp_set_substrate - 0.8;
-  float substrate_on_threshold  = temp_set_substrate + 1.0;
-  float substrate_trend_epsilon = 0.25;
 
+  // ----------------------------------------------------------
+  // Substrate heater: simple on/off at setpoint
+  // Turns ON below setpoint, turns OFF at or above setpoint
+  // ----------------------------------------------------------
   bool substrate_can_switch =
     (millis() - substrate_last_switch_ms) >= substrate_lockout_ms;
-
-  bool prev_substrate_temp_rising = substrate_temp_rising;
-
-  if (temp_substrate_avg > prev_temp_substrate_avg + substrate_trend_epsilon)
-  {
-    substrate_temp_rising = true;
-  }
-  else if (temp_substrate_avg < prev_temp_substrate_avg - substrate_trend_epsilon)
-  {
-    substrate_temp_rising = false;
-  }
 
   if (relay_substrate_on)
   {
     if (substrate_can_switch &&
-        substrate_temp_rising &&
-        temp_substrate_avg >= substrate_off_threshold)
+        temp_substrate_avg >= temp_set_substrate)
     {
+      Serial.println("SUBSTRATE -> OFF");
       digitalWrite(RELAY_SUBSTRATE_PIN, HIGH);   // OFF
       relay_substrate_on = false;
       substrate_last_switch_ms = millis();
-      substrate_restart_armed = false;
     }
   }
   else
   {
-    if (substrate_can_switch && temp_substrate_avg < substrate_off_threshold)
+    if (substrate_can_switch &&
+        temp_substrate_avg < temp_set_substrate)
     {
+      Serial.println("SUBSTRATE -> ON");
       digitalWrite(RELAY_SUBSTRATE_PIN, LOW);    // ON
       relay_substrate_on = true;
       substrate_last_switch_ms = millis();
-      substrate_restart_armed = false;
-    }
-    else
-    {
-      if (prev_substrate_temp_rising && !substrate_temp_rising)
-      {
-        substrate_restart_armed = true;
-      }
-
-      if (substrate_can_switch &&
-          substrate_restart_armed &&
-          temp_substrate_avg <= substrate_on_threshold)
-      {
-        digitalWrite(RELAY_SUBSTRATE_PIN, LOW);  // ON
-        relay_substrate_on = true;
-        substrate_last_switch_ms = millis();
-        substrate_restart_armed = false;
-      }
     }
   }
 
   prev_temp_substrate_avg = temp_substrate_avg;
 }
-
 // ============================================================
 // Valve actuation
 // ============================================================
@@ -718,8 +769,8 @@ void precursorValveActuation()
     if (num_pulse > 0)
     {
         // Reduce pressure sampling during valve operation to minimize timing jitter
-        active_pgauge_samples = 20;  // fast sampling during valve
-        
+        active_pgauge_samples = 10;  // fast sampling during valve
+
         if (valve_state == 0)
         {
             digitalWrite(which_valve == 1 ? RELAY_VALVE1_PIN :
@@ -836,6 +887,10 @@ void readD6FWFlow()
 
 // ============================================================
 // Main loop
+//
+// The loop remains non-blocking for normal sensing/control. Valve timing
+// uses millis() so temperature, pressure, and flow telemetry can continue
+// updating while a valve command is active.
 // ============================================================
 void loop()
 {
@@ -891,6 +946,49 @@ void loop()
       Serial.print(temp_set_prec1); Serial.print(",");
       Serial.print(temp_set_prec2); Serial.print(",");
       Serial.println(temp_set_substrate);
+
+      // Reset precursor controller state whenever either precursor setpoint changes.
+      // This makes small changes like 83 C -> 88 C retrigger startup/pulse logic.
+      if (last_temp_set_prec1 != -999 && temp_set_prec1 != last_temp_set_prec1) {
+        Serial.println("PREC1 setpoint changed: resetting precursor 1 control state");
+        resetPrecursorControlState(
+          relay_prec1_on,
+          prec1_startup_mode,
+          prec1_startup_pulse_stage,
+          prec1_peak_seen,
+          prec1_temp_rising,
+          prec1_pulse_mode,
+          prec1_force_recovery_mode,
+          prec1_peak_temp,
+          prec1_last_switch_ms,
+          prec1_pulse_start_ms,
+          prec1_last_pulse_end_ms,
+          prec1_current_pulse_on_ms,
+          RELAY_PREC1_PIN
+        );
+      }
+
+      if (last_temp_set_prec2 != -999 && temp_set_prec2 != last_temp_set_prec2) {
+        Serial.println("PREC2 setpoint changed: resetting precursor 2 control state");
+        resetPrecursorControlState(
+          relay_prec2_on,
+          prec2_startup_mode,
+          prec2_startup_pulse_stage,
+          prec2_peak_seen,
+          prec2_temp_rising,
+          prec2_pulse_mode,
+          prec2_force_recovery_mode,
+          prec2_peak_temp,
+          prec2_last_switch_ms,
+          prec2_pulse_start_ms,
+          prec2_last_pulse_end_ms,
+          prec2_current_pulse_on_ms,
+          RELAY_PREC2_PIN
+        );
+      }
+
+      last_temp_set_prec1 = temp_set_prec1;
+      last_temp_set_prec2 = temp_set_prec2;
       }
 
       else if (s[0] == 'v')
@@ -950,7 +1048,10 @@ void loop()
   if (now - lastPressureSend >= PRESSURE_INTERVAL_MS)
   {
     lastPressureSend = now;
-    readCVM211PressureTorr();
+
+    if (!busy || valve_state == 1) {
+      readCVM211PressureTorr();
+    }
   }
 
   if (now - lastFlowSend >= FLOW_INTERVAL_MS)
