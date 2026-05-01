@@ -4,11 +4,13 @@ from pathlib import Path
 from typing import List, Dict
 
 class Recipe:
-    def __init__(self, name: str, description: str = ""):
+    def __init__(self, name: str, description: str = "", cycles: int = 1):
         self.name = name
         self.description = description
         self.created = datetime.now().isoformat()
         self.steps = []
+        self.cycles = int(cycles) if int(cycles) >= 1 else 1
+        
     
     def add_valve_step(self, valve_id: int, num_pulses: int, pulse_time: int, purge_time: int):
         """Add a valve command to the recipe"""
@@ -43,13 +45,18 @@ class Recipe:
             'name': self.name,
             'description': self.description,
             'created': self.created,
+            'cycles': self.cycles,   # NEW
             'steps': self.steps
         }
     
     @staticmethod
     def from_dict(data: dict) -> 'Recipe':
         """Create recipe from dictionary"""
-        recipe = Recipe(data['name'], data.get('description', ''))
+        recipe = Recipe(
+            data['name'],
+            data.get('description', ''),
+            data.get('cycles', 1)   # NEW (backward compatible)
+        )
         recipe.created = data.get('created', datetime.now().isoformat())
         recipe.steps = data.get('steps', [])
         return recipe
@@ -84,7 +91,11 @@ class Recipe:
         summary = f"Recipe: {self.name}\n"
         if self.description:
             summary += f"Description: {self.description}\n"
-        summary += f"Steps: {len(self.steps)}\n"
+
+        summary += f"Cycles: {self.cycles}\n"   # NEW
+        summary += f"Steps per cycle: {len(self.steps)}\n"
+        summary += f"Total executions: {len(self.steps) * self.cycles}\n"
+
         summary += "-" * 40 + "\n"
         
         for i, step in enumerate(self.steps, 1):
