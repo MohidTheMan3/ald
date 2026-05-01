@@ -107,13 +107,21 @@ unsigned int purge_time = 0; // milliseconds
 bool purging = LOW;
 
 bool JOB_IN_PROGRESS = LOW;
+float prev_tc4_avg = 0.0;
+bool temp_rising = false;
+
+bool relay2_on = false;
+bool relay2_restart_armed = false;
+
+unsigned long relay2_last_switch_ms = 0;
+const unsigned long relay2_lockout_ms = 5000;
 
 void setup()
 {
   if (DO_NOTHING)
     while(1);
 
-  Serial.begin(9600);
+  Serial.begin(115200);
 
   // relay pins
   pinMode(RELAY1_PIN, OUTPUT);
@@ -129,7 +137,7 @@ void setup()
   for (int i=0;i<7;i++)
     thermocouples[i].begin();
 
-  Serial.begin(9600);
+  Serial.begin(115200);
   while (!Serial)
     Serial.println("Waiting for serial...");
 
@@ -187,16 +195,65 @@ void readThermocouples()
 
 void actuateHeatingElements()
 {
-  // select whichever thermocouple/relay pairs you want to actuate
-  if (tc2_avg > temp_sp2)
+  float off_threshold = temp_sp2 - 1.3;   // e.g. 118.7 for setpoint 120
+  float on_threshold  = temp_sp2 + 1.0;   // e.g. 121.0
+  float trend_epsilon = 0.25;
+
+  bool can_switch = (millis() - relay2_last_switch_ms) >= relay2_lockout_ms;
+
+  // Update trend
+  bool prev_temp_rising = temp_rising;
+
+  if (tc4_avg > prev_tc4_avg + trend_epsilon)
   {
-    digitalWrite(RELAY2_PIN, HIGH);
-    sp2_reached = 1; // hit the setpoint
+      temp_rising = true;
+  }
+  else if (tc4_avg < prev_tc4_avg - trend_epsilon)
+  {
+      temp_rising = false;
+  }
+
+  if (relay2_on)
+  {
+      // Turn OFF early while heating up
+      if (can_switch && temp_rising && tc4_avg >= off_threshold)
+      {
+          digitalWrite(RELAY4_PIN, HIGH);   // heater OFF
+          relay2_on = false;
+          relay2_last_switch_ms = millis();
+          relay2_restart_armed = false;
+      }
   }
   else
   {
-    digitalWrite(RELAY2_PIN, LOW);
+      // Cold-start case
+      if (can_switch && tc4_avg < off_threshold)
+      {
+          digitalWrite(RELAY4_PIN, LOW);    // heater ON
+          relay2_on = true;
+          relay2_last_switch_ms = millis();
+          relay2_restart_armed = false;
+      }
+      else
+      {
+          // Arm restart once temperature has genuinely turned around
+          if (prev_temp_rising && !temp_rising)
+          {
+              relay2_restart_armed = true;
+          }
+
+          // Restart on the way down
+          if (can_switch && relay2_restart_armed && tc4_avg <= on_threshold)
+          {
+              digitalWrite(RELAY4_PIN, LOW);   // heater ON
+              relay2_on = true;
+              relay2_last_switch_ms = millis();
+              relay2_restart_armed = false;
+          }
+      }
   }
+
+  prev_tc4_avg = tc4_avg;
 
   if (tc3_avg > temp_sp3)
   {
