@@ -33,6 +33,12 @@ class ALDMainWindow(QMainWindow):
         self.pressure_log_writer = None
         self.pressure_log_filename = None
         self.pressure_log_counter = 0
+        self.pressure_ema = None
+        self.pressure_ema_alpha = 0.5
+        self.pressure_baseline_window = deque(maxlen=200)   # 5s baseline at 10Hz
+        self.pressure_spike_threshold = 1.5                # mTorr above baseline
+        self.pressure_spike_active = False
+        self.pressure_spike_peak = 0.0
         # Temperature data storage
         self.temp_data = {
             'tc2': deque(maxlen=2000),
@@ -44,10 +50,10 @@ class ALDMainWindow(QMainWindow):
         }
         # Pressure and flow data storage
         self.pressure_data = {
-            'value': deque(maxlen=20000),
-            'unit': deque(maxlen=20000),
-            'time': deque(maxlen=20000),
-            'timestamp': deque(maxlen=20000)
+            'value': deque(maxlen=100000),
+            'unit': deque(maxlen=100000),
+            'time': deque(maxlen=100000),
+            'timestamp': deque(maxlen=100000)
         }
         self.flow_data = {
             'value': deque(maxlen=20000),
@@ -112,47 +118,101 @@ class ALDMainWindow(QMainWindow):
         # Batch update counter to reduce graph redraws
         self.graph_update_pending = False
     
-    def parse_temperature_data(self, msg):
-        """Parse temperature data from Arduino messages"""
-        if msg.upper().startswith('T:'):
+    def parse_pressure_data(self, msg):
+        """Parse pressure data from Arduino messages"""
+        if msg.upper().startswith('P:'):
             try:
-                temp_str = msg[2:].strip()
-                temps = [t.strip() for t in temp_str.split(';')]
-                if len(temps) >= 4:
+                parts = msg[2:].strip().split()
+                if len(parts) >= 2:
+                    value = float(parts[0])
+                    unit = parts[1]
+
+                    # Exponential moving average filter
+                    if self.pressure_ema is None:
+                        self.pressure_ema = value
+                    else:
+                        # Use faster alpha during active spike for better peak tracking
+                        # Use slower alpha during baseline for better noise rejection
+                        active_alpha = 0.4 if self.pressure_spike_active else 0.15
+                        self.pressure_ema = active_alpha * value + (1 - active_alpha) * self.pressure_ema
+                    value = self.pressure_ema
+
+                    # Store data and update graph
+                    self.pressure_data['value'].append(value)
+                    self.pressure_data['unit'].append(unit)
+                    self.pressure_data['time'].append(self.time_counter)
                     now = datetime.now()
                     if self.start_time is None:
                         self.start_time = now
-
-                    tc2_val = float(temps[2])
-                    tc3_val = float(temps[1])
-                    tc4_val = float(temps[0])
-                    tc5_val = float(temps[3])
-
-                    self.temp_data['tc2'].append(tc2_val)
-                    self.temp_data['tc3'].append(tc3_val)
-                    self.temp_data['tc4'].append(tc4_val)
-                    self.temp_data['tc5'].append(tc5_val)
-                    self.temp_data['time'].append(self.time_counter)
-                    self.temp_data['timestamp'].append(now)
-                    self.time_counter += 1
+                    self.pressure_data['timestamp'].append(now)
                     self.graph_update_pending = True
 
-                    # Write to continuous log (pressure/flow use latest known values)
-                    # Write to temp log
-                    if self.temp_log_writer is not None:
+                    # Write to pressure log
+                    if self.pressure_log_writer is not None and self.start_time is not None:
                         time_sec = (now - self.start_time).total_seconds()
-                        self.temp_log_writer.writerow([
+                        flow_val = self.flow_data['value'][-1] if self.flow_data['value'] else ''
+                        self.pressure_log_writer.writerow([
                             now.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
                             f"{time_sec:.2f}",
-                            tc2_val, tc3_val, tc4_val, tc5_val
+                            f"{value:.4f}",
+                            unit,
+                            f"{flow_val:.3f}" if flow_val != '' else ''
                         ])
-                        if self.time_counter % 60 == 0:
-                            self.temp_log_file.flush()
-                    self.check_temperature_safety(tc2_val, tc3_val, tc4_val, tc5_val)
+                        self.pressure_log_counter += 1
+                        if self.pressure_log_counter % 60 == 0:
+                            self.pressure_log_file.flush()
+
+                    # Real-time valve event detection
+                    self.pressure_baseline_window.append(value)
+                    if len(self.pressure_baseline_window) == 50:
+                        baseline = sorted(self.pressure_baseline_window)[int(len(self.pressure_baseline_window) * 0.5)]
+                        deviation = value - baseline
+
+                        if deviation > self.pressure_spike_threshold:
+                            if not self.pressure_spike_active:
+                                self.pressure_spike_active = True
+                                self.pressure_spike_peak = deviation
+                                now_str = datetime.now().strftime('%H:%M:%S')
+                                self.log_text.append(
+                                    f"[VALVE EVENT] Pressure spike detected: "
+                                    f"{deviation:.2f} mTorr above baseline at {now_str}"
+                                )
+                            else:
+                                if deviation > self.pressure_spike_peak + self.pressure_spike_threshold:
+                                    self.pressure_spike_peak = deviation
+                                    now_str = datetime.now().strftime('%H:%M:%S')
+                                    self.log_text.append(
+                                        f"[VALVE EVENT] Second pressure spike detected: "
+                                        f"{deviation:.2f} mTorr above baseline at {now_str}"
+                                    )
+                                else:
+                                    self.pressure_spike_peak = max(self.pressure_spike_peak, deviation)
+                        else:
+                            if self.pressure_spike_active:
+                                if deviation < self.pressure_spike_threshold * 0.3:
+                                    self.pressure_spike_active = False
+                                    self.pressure_spike_peak = 0.0
+                                    now_str = datetime.now().strftime('%H:%M:%S')
+                                    self.log_text.append(
+                                        f"[VALVE EVENT] Reached baseline pressure at {now_str}"
+                                    )
 
             except (ValueError, IndexError):
                 pass
-                        
+
+    def parse_flow_data(self, msg):
+        """Parse flow data from Arduino messages"""
+        if msg.upper().startswith('F:'):
+            try:
+                parts = msg[2:].strip().split()
+                if len(parts) >= 1:
+                    value = float(parts[0])
+                    self.flow_data['value'].append(value)
+                    self.flow_data['time'].append(self.time_counter)
+                    self.flow_data['timestamp'].append(datetime.now())
+            except (ValueError, IndexError):
+                pass
+                                    
     def check_temperature_safety(self, tc2, tc3, tc4, tc5):
         """Check if any temperature exceeds setpoint by more than 50°C"""
         if not self.temp_setpoints_initialized:
@@ -204,52 +264,47 @@ class ALDMainWindow(QMainWindow):
         finally:
             self.operation_in_progress = False
 
-    def parse_pressure_data(self, msg):
-        """Parse pressure data from Arduino messages"""
-        if msg.upper().startswith('P:'):
+    def parse_temperature_data(self, msg):
+        """Parse temperature data from Arduino messages"""
+        if msg.upper().startswith('T:'):
             try:
-                parts = msg[2:].strip().split()
-                if len(parts) >= 2:
-                    value = float(parts[0])
-                    unit = parts[1]
-                    self.pressure_data['value'].append(value)
-                    self.pressure_data['unit'].append(unit)
-                    self.pressure_data['time'].append(self.time_counter)
+                temp_str = msg[2:].strip()
+                temps = [t.strip() for t in temp_str.split(';')]
+                if len(temps) >= 4:
                     now = datetime.now()
-                    if self.start_time is None:  
+                    if self.start_time is None:
                         self.start_time = now
-                    self.pressure_data['timestamp'].append(now)
-                    self.graph_update_pending = True  
-                    # Write to pressure log
-                    if self.pressure_log_writer is not None and self.start_time is not None:
+
+                    tc2_val = float(temps[0])  # delivery
+                    tc3_val = float(temps[1])  # prec1
+                    tc4_val = float(temps[2])  # prec2
+                    tc5_val = float(temps[3])  # substrate
+
+                    self.temp_data['tc2'].append(tc2_val)
+                    self.temp_data['tc3'].append(tc3_val)
+                    self.temp_data['tc4'].append(tc4_val)
+                    self.temp_data['tc5'].append(tc5_val)
+                    self.temp_data['time'].append(self.time_counter)
+                    self.temp_data['timestamp'].append(now)
+                    self.time_counter += 1
+                    self.graph_update_pending = True
+
+                    # Write to temp log
+                    if self.temp_log_writer is not None:
                         time_sec = (now - self.start_time).total_seconds()
-                        flow_val = self.flow_data['value'][-1] if self.flow_data['value'] else ''
-                        self.pressure_log_writer.writerow([
+                        self.temp_log_writer.writerow([
                             now.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
                             f"{time_sec:.2f}",
-                            f"{value:.4f}",
-                            unit,
-                            f"{flow_val:.3f}" if flow_val != '' else ''
+                            tc2_val, tc3_val, tc4_val, tc5_val
                         ])
-                        # flush every 60 pressure samples (~3s at 20Hz)
-                        self.pressure_log_counter += 1
-                        if self.pressure_log_counter % 60 == 0:
-                            self.pressure_log_file.flush()
-            except (ValueError, IndexError):
-                pass
-    def parse_flow_data(self, msg):
-        """Parse flow data from Arduino messages"""
-        if msg.upper().startswith('F:'):
-            try:
-                parts = msg[2:].strip().split()
-                if len(parts) >= 1:
-                    value = float(parts[0])
-                    self.flow_data['value'].append(value)
-                    self.flow_data['time'].append(self.time_counter)
-                    self.flow_data['timestamp'].append(datetime.now())
-            except (ValueError, IndexError):
-                pass
+                        if self.time_counter % 60 == 0:
+                            self.temp_log_file.flush()
 
+                    self.check_temperature_safety(tc2_val, tc3_val, tc4_val, tc5_val)
+
+            except (ValueError, IndexError):
+                pass
+            
     def handle_arduino_status(self, msg):
         """Handle status messages from Arduino"""
         msg_lower = msg.lower()
@@ -304,7 +359,7 @@ class ALDMainWindow(QMainWindow):
         # Connection controls
         conn_layout = QHBoxLayout()
         conn_layout.addWidget(QLabel("COM Port:"))
-        self.port_input = QLineEdit("COM3")
+        self.port_input = QLineEdit("COM5")
         self.port_input.setMaximumWidth(100)
         conn_layout.addWidget(self.port_input)
         
@@ -620,6 +675,17 @@ class ALDMainWindow(QMainWindow):
         desc_layout.addWidget(self.recipe_desc_input)
         builder_layout.addLayout(desc_layout)
         
+        cycles_layout = QHBoxLayout()
+        cycles_layout.addWidget(QLabel("Cycles:"))
+
+        self.recipe_cycles_input = QLineEdit("1")
+        self.recipe_cycles_input.setMaximumWidth(80)
+
+        cycles_layout.addWidget(self.recipe_cycles_input)
+        cycles_layout.addStretch()
+
+        builder_layout.addLayout(cycles_layout)
+
         # Buttons for adding steps
         step_buttons = QHBoxLayout()
         
@@ -829,7 +895,7 @@ class ALDMainWindow(QMainWindow):
         if self.start_time is None:
             return
         
-        max_display_points = 500
+        max_display_points = 1000
         
         data_len = len(self.temp_data['timestamp'])
         start_idx = max(0, data_len - max_display_points)
@@ -1076,6 +1142,10 @@ class ALDMainWindow(QMainWindow):
             self.estop_btn.setEnabled(True)
             self.reset_btn.setEnabled(True)
             self.start_data_logging()
+            self.pressure_ema = None
+            self.pressure_spike_active = False
+            self.pressure_spike_peak = 0.0
+            self.pressure_baseline_window.clear()
             self.log_text.append(f"Connected to {port}")
         except Exception as e:
             QMessageBox.critical(self, "Connection Error", f"Failed to connect: {e}")
@@ -1588,6 +1658,7 @@ class ALDMainWindow(QMainWindow):
         
         self.current_recipe.name = self.recipe_name_input.text()
         self.current_recipe.description = self.recipe_desc_input.text()
+        self.current_recipe.cycles = int(self.recipe_cycles_input.text())
         
         try:
             self.current_recipe.save()
@@ -1627,19 +1698,39 @@ class ALDMainWindow(QMainWindow):
                 self.current_recipe = Recipe.load(f"recipes/{recipe_name}.json")
                 self.recipe_selector.setText(recipe_name)
                 self.recipe_info.setText(self.current_recipe.get_summary())
+                self.recipe_cycles_input.setText(str(self.current_recipe.cycles))
                 self.run_recipe_btn.setEnabled(True)
             except Exception as e:
                 QMessageBox.critical(self, "Load Failed", f"Could not load recipe:\n{e}")
-    async def wait_for_temp_stabilization(self, tc2_sp, tc3_sp, tc4_sp, tc5_sp, 
-                                        tolerance=2.0, stable_seconds=10, 
-                                        timeout_seconds=600):
-        """Wait until all TCs are within tolerance of setpoints for stable_seconds"""
+    async def wait_for_temp_stabilization(
+        self,
+        tc2_sp,
+        tc3_sp,
+        tc4_sp,
+        tc5_sp,
+        tolerance=5.0,
+        stable_seconds=10,
+        timeout_seconds=2000,
+        wait_for_stabilization=True
+    ):
+        """
+        Wait until all TCs are within tolerance of setpoints for stable_seconds.
+
+        If wait_for_stabilization is False, do not block waiting; just log and return immediately.
+        """
+        if not wait_for_stabilization:
+            self.log_text.append(
+                f"[RECIPE] Skipping temperature stabilization wait "
+                f"(setpoints: TC2:{tc2_sp} TC3:{tc3_sp} TC4:{tc4_sp} TC5:{tc5_sp})"
+            )
+            return True
+
         stable_count = 0
-        required_count = stable_seconds  # checking every ~1s
+        required_count = stable_seconds   # checking every ~1s
         elapsed = 0
 
         while elapsed < timeout_seconds:
-            await asyncio.sleep(1)
+            await self.qt_sleep(1)
             elapsed += 1
 
             if len(self.temp_data['tc2']) == 0:
@@ -1664,9 +1755,17 @@ class ALDMainWindow(QMainWindow):
                     f"(TC2:{tc2:.1f} TC3:{tc3:.1f} TC4:{tc4:.1f} TC5:{tc5:.1f})"
                 )
             else:
-                stable_count = 0  # reset if any TC drifts out
+                stable_count = 0
+                self.log_text.append(
+                    f"[RECIPE] Waiting for stabilization... "
+                    f"(TC2:{tc2:.1f}/{tc2_sp} "
+                    f"TC3:{tc3:.1f}/{tc3_sp} "
+                    f"TC4:{tc4:.1f}/{tc4_sp} "
+                    f"TC5:{tc5:.1f}/{tc5_sp})"
+                )
 
             if stable_count >= required_count:
+                self.log_text.append("[RECIPE] Temperature stabilization condition satisfied.")
                 return True
 
         tc2 = self.temp_data['tc2'][-1] if self.temp_data['tc2'] else float('nan')
@@ -1680,9 +1779,8 @@ class ALDMainWindow(QMainWindow):
             f"Setpoints: {tc2_sp}/{tc3_sp}/{tc4_sp}/{tc5_sp}"
         )
         
-
-    @asyncSlot()
-    async def run_recipe(self):
+    def run_recipe(self):
+        """Validate and confirm synchronously, then launch recipe task"""
         if self.current_recipe is None:
             QMessageBox.warning(self, "No Recipe", "Please load a recipe first.")
             return
@@ -1694,13 +1792,16 @@ class ALDMainWindow(QMainWindow):
             return
 
         total_duration_ms = 0
-        for step in self.current_recipe.steps:
-            if step['type'] == 'valve':
-                total_duration_ms += self.calculate_valve_duration(
-                    step['num_pulses'], step['pulse_time'], step['purge_time']
-                )
-            elif step['type'] == 'wait':
-                total_duration_ms += step['duration'] * 1000
+        num_cycles = self.current_recipe.cycles
+
+        for cycle in range(num_cycles):
+            for step in self.current_recipe.steps:
+                if step['type'] == 'valve':
+                    total_duration_ms += self.calculate_valve_duration(
+                        step['num_pulses'], step['pulse_time'], step['purge_time']
+                    )
+                elif step['type'] == 'wait':
+                    total_duration_ms += step['duration'] * 1000
 
         reply = QMessageBox.question(
             self, "Run Recipe",
@@ -1710,86 +1811,145 @@ class ALDMainWindow(QMainWindow):
             f"You can use Emergency Stop if needed.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
-        if reply != QMessageBox.StandardButton.Yes:
+
+        if reply == QMessageBox.StandardButton.Yes:
+            asyncio.create_task(self._run_recipe_coro())
+
+    async def _run_recipe_coro(self):
+        if self.current_recipe is None:
+            QMessageBox.warning(self, "No Recipe", "Please load a recipe first.")
+            return
+        if self.recipe_running:
+            QMessageBox.warning(self, "Recipe Running", "A recipe is already running.")
+            return
+        if self.operation_in_progress:
+            QMessageBox.warning(self, "Busy", "Another operation is in progress. Please wait.")
+            return
+
+        num_cycles = getattr(self.current_recipe, "cycles", 1)
+        if num_cycles < 1:
+            QMessageBox.warning(self, "Recipe Error", "Recipe cycles must be >= 1.")
             return
 
         self.recipe_running = True
         self.operation_in_progress = True
         self.run_recipe_btn.setEnabled(False)
-        self.recipe_total_steps = len(self.current_recipe.steps)
+        self.recipe_total_steps = len(self.current_recipe.steps) * num_cycles
 
         try:
-            for i, step in enumerate(self.current_recipe.steps, 1):
-                self.recipe_step_index = i
-                self.recipe_step_label.setText(f"{i}/{self.recipe_total_steps}")
-                self.log_text.append(f"[RECIPE] Step {i}/{self.recipe_total_steps}: {step['type']}")
+            global_step = 0
 
-                if step['type'] == 'valve':
-                    await self.controller.valve(
-                        step['valve_id'], step['num_pulses'],
-                        step['pulse_time'], step['purge_time']
+            for cycle in range(1, num_cycles + 1):
+                self.log_text.append(f"[RECIPE] Starting cycle {cycle}/{num_cycles}")
+
+                for local_step, step in enumerate(self.current_recipe.steps, 1):
+                    global_step += 1
+                    self.recipe_step_index = global_step
+                    self.recipe_step_label.setText(
+                        f"Cycle {cycle}/{num_cycles} | Step {local_step}/{len(self.current_recipe.steps)}"
                     )
-                    duration_sec = self.calculate_valve_duration(
-                        step['num_pulses'], step['pulse_time'], step['purge_time']
-                    ) / 1000
-                    self.log_text.append(f"[RECIPE] Valve running, waiting {duration_sec:.1f}s...")
-
-                    # Count down in 1s chunks so UI stays responsive
-                    remaining = duration_sec
-                    while remaining > 0:
-                        chunk = min(remaining, 1)
-                        await asyncio.sleep(chunk)
-                        remaining -= chunk
-                        self.time_remaining_label.setText(f"{remaining:.0f}s remaining (valve)")
-                    self.log_text.append(f"[RECIPE] Valve step complete")
-
-                elif step['type'] == 'temp':
-                    await self.controller.temp(
-                        step['tc2'], step['tc3'], step['tc4'], step['tc5']
-                    )
-                    self.temp_setpoints = {
-                        'tc2': step['tc2'], 'tc3': step['tc3'],
-                        'tc4': step['tc4'], 'tc5': step['tc5']
-                    }
-                    self.temp_setpoints_initialized = True
-                    self.tc2_setpoint_display.setText(f"→ {step['tc2']}°C")
-                    self.tc3_setpoint_display.setText(f"→ {step['tc3']}°C")
-                    self.tc4_setpoint_display.setText(f"→ {step['tc4']}°C")
-                    self.tc5_setpoint_display.setText(f"→ {step['tc5']}°C")
                     self.log_text.append(
-                        f"[RECIPE] Waiting for temps to stabilize at "
-                        f"TC2:{step['tc2']} TC3:{step['tc3']} "
-                        f"TC4:{step['tc4']} TC5:{step['tc5']}°C..."
+                        f"[RECIPE] Cycle {cycle}/{num_cycles} | "
+                        f"Step {local_step}/{len(self.current_recipe.steps)}: {step['type']}"
                     )
-                    await self.wait_for_temp_stabilization(
-                        step['tc2'], step['tc3'], step['tc4'], step['tc5']
-                    )
-                    self.log_text.append(f"[RECIPE] Temperature step complete - all TCs stable")
 
-                elif step['type'] == 'wait':
-                    self.log_text.append(f"[RECIPE] Waiting {step['duration']}s...")
-                    remaining = step['duration']
-                    while remaining > 0:
-                        chunk = min(remaining, 1)
-                        await asyncio.sleep(chunk)
-                        remaining -= chunk
-                        self.time_remaining_label.setText(f"{remaining}s remaining (wait)")
-                    self.log_text.append(f"[RECIPE] Wait complete")
+                    if step['type'] == 'valve':
+                        await self.controller.valve(
+                            step['valve_id'],
+                            step['num_pulses'],
+                            step['pulse_time'],
+                            step['purge_time']
+                        )
+                        duration_sec = self.calculate_valve_duration(
+                            step['num_pulses'],
+                            step['pulse_time'],
+                            step['purge_time']
+                        ) / 1000
+                        self.log_text.append(f"[RECIPE] Valve running, waiting {duration_sec:.1f}s...")
+
+                        remaining = duration_sec
+                        while remaining > 0:
+                            chunk = min(remaining, 1)
+                            await self.qt_sleep(chunk)
+                            remaining -= chunk
+                            self.time_remaining_label.setText(
+                                f"Cycle {cycle}/{num_cycles} | {remaining:.0f}s remaining (valve)"
+                            )
+                        self.log_text.append("[RECIPE] Valve step complete")
+                        await self.qt_sleep(0.5)
+                    elif step['type'] == 'temp':
+                        await self.controller.temp(
+                            step['tc2'],
+                            step['tc3'],
+                            step['tc4'],
+                            step['tc5']
+                        )
+                        self.temp_setpoints = {
+                            'tc2': step['tc2'],
+                            'tc3': step['tc3'],
+                            'tc4': step['tc4'],
+                            'tc5': step['tc5']
+                        }
+                        self.temp_setpoints_initialized = True
+                        self.tc2_setpoint_display.setText(f"→ {step['tc2']}°C")
+                        self.tc3_setpoint_display.setText(f"→ {step['tc3']}°C")
+                        self.tc4_setpoint_display.setText(f"→ {step['tc4']}°C")
+                        self.tc5_setpoint_display.setText(f"→ {step['tc5']}°C")
+                        self.log_text.append(
+                            f"[RECIPE] Waiting for temps to stabilize at "
+                            f"TC2:{step['tc2']} TC3:{step['tc3']} "
+                            f"TC4:{step['tc4']} TC5:{step['tc5']}°C..."
+                        )
+                        await self.wait_for_temp_stabilization(
+                            step['tc2'],
+                            step['tc3'],
+                            step['tc4'],
+                            step['tc5'],
+                            wait_for_stabilization=(cycle == 1)
+                        )
+                        self.log_text.append("[RECIPE] Temperature step complete - all TCs stable")
+
+                    elif step['type'] == 'wait':
+                        self.log_text.append(f"[RECIPE] Waiting {step['duration']}s...")
+                        remaining = step['duration']
+                        while remaining > 0:
+                            chunk = min(remaining, 1)
+                            await self.qt_sleep(chunk)
+                            remaining -= chunk
+                            self.time_remaining_label.setText(
+                                f"Cycle {cycle}/{num_cycles} | {remaining}s remaining (wait)"
+                            )
+                        self.log_text.append("[RECIPE] Wait complete")
+
+                self.log_text.append(f"[RECIPE] Finished cycle {cycle}/{num_cycles}")
 
             self.log_text.append(f"[RECIPE] '{self.current_recipe.name}' completed successfully!")
             self.recipe_step_label.setText("Complete")
-            QMessageBox.information(self, "Recipe Complete", "Recipe executed successfully!")
+            self.time_remaining_label.setText("Recipe complete")
 
         except Exception as e:
             self.log_text.append(f"[RECIPE] Error at step {self.recipe_step_index}: {e}")
-            QMessageBox.critical(self, "Recipe Failed", 
-                                f"Recipe failed at step {self.recipe_step_index}:\n\n{e}")
+            QMessageBox.critical(
+                self,
+                "Recipe Failed",
+                f"Recipe failed at step {self.recipe_step_index}:\n\n{e}"
+            )
         finally:
             self.recipe_running = False
             self.operation_in_progress = False
             self.run_recipe_btn.setEnabled(True)
             self.time_remaining_label.setText("Complete")
     # @asyncSlot()
+
+    async def qt_sleep(self, seconds):
+        """Polling-based sleep compatible with qasync + Python 3.12"""
+        import time
+        deadline = time.monotonic() + seconds
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            # Sleep in small chunks to keep both event loops responsive
+            chunk = min(remaining, 0.05)  # 50ms chunks
+            await asyncio.sleep(chunk)
     # async def run_recipe(self):
     #     if self.current_recipe is None:
     #         QMessageBox.warning(self, "No Recipe", "Please load a recipe first.")
