@@ -25,6 +25,27 @@ from ald_recipe import Recipe, RECIPES_DIR
 USAGE_FILE = Path(__file__).parent / "precursor_usage.json"
 PULSE_MSG = re.compile(r'V: Pulsing valve (\d) (\d+)ms')
 
+async def msgbox(kind, parent, title, text,
+                 buttons=QMessageBox.StandardButton.Ok,
+                 default=QMessageBox.StandardButton.NoButton):
+    """QMessageBox.<kind>() for use inside async code.
+
+    The static QMessageBox calls run a nested Qt event loop; under qasync that
+    re-enters the serial reader task and kills it ("Cannot enter into task").
+    open() + awaiting the result keeps everything on the one event loop.
+    """
+    icons = {'critical': QMessageBox.Icon.Critical, 'warning': QMessageBox.Icon.Warning,
+             'information': QMessageBox.Icon.Information, 'question': QMessageBox.Icon.Question}
+    box = QMessageBox(icons[kind], title, text, buttons, parent)
+    if default != QMessageBox.StandardButton.NoButton:
+        box.setDefaultButton(default)
+    done = asyncio.get_event_loop().create_future()
+    box.finished.connect(lambda _: done.done() or done.set_result(
+        box.standardButton(box.clickedButton()) if box.clickedButton() else QMessageBox.StandardButton.NoButton))
+    box.open()
+    return await done
+
+
 
 def validate_step(step):
     """Raise ValueError if a recipe step is invalid (pydantic's ValidationError is a ValueError)."""
@@ -329,7 +350,7 @@ class ALDMainWindow(QMainWindow):
             self.status_label.setStyleSheet("background-color: #c0392b; color: white; padding: 10px; font-weight: bold;")
             
             overheat_msg = "\n".join(overheat_elements)
-            QMessageBox.critical(
+            await msgbox('critical', 
                 self,
                 "⚠️ OVERHEAT EMERGENCY STOP ⚠️",
                 f"Emergency stop triggered due to overheating!\n\n"
@@ -343,7 +364,7 @@ class ALDMainWindow(QMainWindow):
             
         except Exception as e:
             self.log_text.append(f"[ERROR] Failed to send emergency stop: {e}")
-            QMessageBox.critical(self, "Error", f"Failed to send emergency stop: {e}")
+            await msgbox('critical', self, "Error", f"Failed to send emergency stop: {e}")
         finally:
             self.operation_in_progress = False
 
@@ -1329,7 +1350,7 @@ class ALDMainWindow(QMainWindow):
             self.spike_count = 0
             self.log_text.append(f"Connected to {port}")
         except Exception as e:
-            QMessageBox.critical(self, "Connection Error", f"Failed to connect: {e}")
+            await msgbox('critical', self, "Connection Error", f"Failed to connect: {e}")
         finally:
             self.operation_in_progress = False
     
@@ -1363,12 +1384,12 @@ class ALDMainWindow(QMainWindow):
     @asyncSlot()
     async def send_valve(self):
         if self.operation_in_progress:
-            QMessageBox.warning(self, "Busy", "Another operation is in progress. Please wait.")
+            await msgbox('warning', self, "Busy", "Another operation is in progress. Please wait.")
             return
             
         if self.valve_job_running:
             self.log_text.append(f"[DEBUG] Blocked valve command - job already running")
-            QMessageBox.warning(
+            await msgbox('warning', 
                 self,
                 "Job Already Running",
                 "A valve command is already in progress.\n\n"
@@ -1384,7 +1405,7 @@ class ALDMainWindow(QMainWindow):
             purge_time_text = self.purge_time_input.text().strip()
             
             if not all([valve_id_text, num_pulses_text, pulse_time_text, purge_time_text]):
-                QMessageBox.warning(self, "Input Error", "All valve fields must be filled in.")
+                await msgbox('warning', self, "Input Error", "All valve fields must be filled in.")
                 return
             
             valve_id = int(valve_id_text)
@@ -1394,7 +1415,7 @@ class ALDMainWindow(QMainWindow):
             # Range limits live in one place: ValveCommand (ald_models.py),
             # checked by controller.valve() below.
         except ValueError:
-            QMessageBox.warning(self, "Input Error", "Please enter valid whole numbers for all valve fields.")
+            await msgbox('warning', self, "Input Error", "Please enter valid whole numbers for all valve fields.")
             return
         
         self.operation_in_progress = True
@@ -1418,22 +1439,22 @@ class ALDMainWindow(QMainWindow):
         except ValidationError as e:
             self.valve_job_running = False
             self.job_timer.stop()
-            QMessageBox.warning(self, "Validation Error", str(e))
+            await msgbox('warning', self, "Validation Error", str(e))
         except Exception as e:
             self.valve_job_running = False
             self.job_timer.stop()
-            QMessageBox.critical(self, "Error", str(e))
+            await msgbox('critical', self, "Error", str(e))
         finally:
             self.operation_in_progress = False
     
     @asyncSlot()
     async def send_temp(self):
         if self.operation_in_progress:
-            QMessageBox.warning(self, "Busy", "Another operation is in progress. Please wait.")
+            await msgbox('warning', self, "Busy", "Another operation is in progress. Please wait.")
             return
             
         if self.valve_job_running:
-            reply = QMessageBox.question(
+            reply = await msgbox('question', 
                 self,
                 "Valve Job Running",
                 "A valve command is currently in progress.\n\n"
@@ -1455,7 +1476,7 @@ class ALDMainWindow(QMainWindow):
             
             # Check for empty or invalid inputs
             if not all([tc2_text, tc3_text, tc4_text, tc5_text]):
-                QMessageBox.warning(self, "Input Error", "All temperature fields must be filled in.")
+                await msgbox('warning', self, "Input Error", "All temperature fields must be filled in.")
                 return
             
             tc2 = int(float(tc2_text))
@@ -1466,11 +1487,11 @@ class ALDMainWindow(QMainWindow):
             # Range validation
             for name, val in [("TC2", tc2), ("TC3", tc3), ("TC4", tc4), ("TC5", tc5)]:
                 if val < 0 or val > 500:
-                    QMessageBox.warning(self, "Input Error", f"{name} must be between 0 and 500°C")
+                    await msgbox('warning', self, "Input Error", f"{name} must be between 0 and 500°C")
                     return
                     
         except ValueError:
-            QMessageBox.warning(self, "Input Error", "Please enter valid numbers for all temperature fields.\n\nExample: 50, 30.5, etc.")
+            await msgbox('warning', self, "Input Error", "Please enter valid numbers for all temperature fields.\n\nExample: 50, 30.5, etc.")
             return
         
         self.operation_in_progress = True
@@ -1492,16 +1513,16 @@ class ALDMainWindow(QMainWindow):
             self.log_command('TEMP', cmd_str, f'Targets: TC2={tc2}, TC3={tc3}, TC4={tc4}, TC5={tc5}')
             
         except ValidationError as e:
-            QMessageBox.warning(self, "Validation Error", str(e))
+            await msgbox('warning', self, "Validation Error", str(e))
         except Exception as e:
-            QMessageBox.critical(self, "Error", str(e))
+            await msgbox('critical', self, "Error", str(e))
         finally:
             self.operation_in_progress = False
     
     @asyncSlot()
     async def send_test(self):
         if self.operation_in_progress:
-            QMessageBox.warning(self, "Busy", "Another operation is in progress. Please wait.")
+            await msgbox('warning', self, "Busy", "Another operation is in progress. Please wait.")
             return
             
         self.operation_in_progress = True
@@ -1510,14 +1531,14 @@ class ALDMainWindow(QMainWindow):
             self.log_text.append("Sent: TEST")
             self.log_command('TEST', 'TEST', 'Test communication')
         except Exception as e:
-            QMessageBox.critical(self, "Error", str(e))
+            await msgbox('critical', self, "Error", str(e))
         finally:
             self.operation_in_progress = False
     
     @asyncSlot()
     async def send_begin(self):
         if self.operation_in_progress:
-            QMessageBox.warning(self, "Busy", "Another operation is in progress. Please wait.")
+            await msgbox('warning', self, "Busy", "Another operation is in progress. Please wait.")
             return
             
         self.operation_in_progress = True
@@ -1526,14 +1547,14 @@ class ALDMainWindow(QMainWindow):
             self.log_text.append("Sent: BEGIN")
             self.log_command('BEGIN', 'BEGIN', 'Start sequence')
         except Exception as e:
-            QMessageBox.critical(self, "Error", str(e))
+            await msgbox('critical', self, "Error", str(e))
         finally:
             self.operation_in_progress = False
     
-    @asyncSlot()
+    @asyncSlot(bool)  # clicked(bool) passes the new checked state
     async def toggle_tc_bypass(self, checked):
         if checked:
-            reply = QMessageBox.warning(
+            reply = await msgbox('warning', 
                 self, "Ignore thermocouple faults?",
                 "Heaters will keep running on the LAST GOOD reading of a faulted thermocouple "
                 "(it may be frozen and below setpoint).\n\n"
@@ -1553,7 +1574,7 @@ class ALDMainWindow(QMainWindow):
         except Exception as e:
             self.tc_bypass_timer.stop()
             self.tc_bypass_cb.setChecked(False)
-            QMessageBox.critical(self, "Error", str(e))
+            await msgbox('critical', self, "Error", str(e))
 
     @asyncSlot()
     async def send_tc_bypass(self):
@@ -1569,12 +1590,12 @@ class ALDMainWindow(QMainWindow):
             await self.controller.heaters_off()
             self.log_command('HEATERS_OFF', 'h', 'All heaters off')
         except Exception as e:
-            QMessageBox.critical(self, "Error", str(e))
+            await msgbox('critical', self, "Error", str(e))
 
     @asyncSlot()
     async def emergency_stop(self):
         """Send emergency stop command to Arduino - LOCKS SYSTEM"""
-        reply = QMessageBox.critical(
+        reply = await msgbox('critical', 
             self, 
             "⚠️ EMERGENCY STOP ⚠️", 
             "WARNING: This will LOCK the Arduino in emergency stop state!\n\n"
@@ -1603,7 +1624,7 @@ class ALDMainWindow(QMainWindow):
                 self.estop_btn.setEnabled(False)
                 self.reset_btn.setEnabled(False)
                 
-                QMessageBox.information(
+                await msgbox('information', 
                     self,
                     "Emergency Stop Activated",
                     "Emergency stop activated.\n\n"
@@ -1612,7 +1633,7 @@ class ALDMainWindow(QMainWindow):
                 )
                 
             except Exception as e:
-                QMessageBox.critical(self, "Error", f"Failed to send emergency stop: {e}")
+                await msgbox('critical', self, "Error", f"Failed to send emergency stop: {e}")
             finally:
                 self.operation_in_progress = False
     
@@ -1620,7 +1641,7 @@ class ALDMainWindow(QMainWindow):
     async def reset_system(self):
         """Send reset command - clears pulse counter without locking"""
         if self.operation_in_progress:
-            QMessageBox.warning(self, "Busy", "Another operation is in progress. Please wait.")
+            await msgbox('warning', self, "Busy", "Another operation is in progress. Please wait.")
             return
             
         self.operation_in_progress = True
@@ -1632,14 +1653,14 @@ class ALDMainWindow(QMainWindow):
             self.time_remaining_label.setText("--")
             self.log_text.append("Reset command sent - pulse counter cleared")
             self.log_text.append(f"[DEBUG] Set valve_job_running = False (manual reset)")
-            QMessageBox.information(
+            await msgbox('information', 
                 self,
                 "Reset Complete",
                 "Valve pulse counter has been reset.\n\n"
                 "System is ready for new commands."
             )
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to send reset: {e}")
+            await msgbox('critical', self, "Error", f"Failed to send reset: {e}")
         finally:
             self.operation_in_progress = False
     
@@ -2068,18 +2089,18 @@ class ALDMainWindow(QMainWindow):
 
     async def _run_recipe_coro(self):
         if self.loaded_recipe is None:
-            QMessageBox.warning(self, "No Recipe", "Please load a recipe first.")
+            await msgbox('warning', self, "No Recipe", "Please load a recipe first.")
             return
         if self.recipe_running:
-            QMessageBox.warning(self, "Recipe Running", "A recipe is already running.")
+            await msgbox('warning', self, "Recipe Running", "A recipe is already running.")
             return
         if self.operation_in_progress:
-            QMessageBox.warning(self, "Busy", "Another operation is in progress. Please wait.")
+            await msgbox('warning', self, "Busy", "Another operation is in progress. Please wait.")
             return
 
         num_cycles = getattr(self.loaded_recipe, "cycles", 1)
         if num_cycles < 1:
-            QMessageBox.warning(self, "Recipe Error", "Recipe cycles must be >= 1.")
+            await msgbox('warning', self, "Recipe Error", "Recipe cycles must be >= 1.")
             return
 
         self.recipe_running = True
@@ -2191,7 +2212,7 @@ class ALDMainWindow(QMainWindow):
         except Exception as e:
             self.log_text.append(f"[RECIPE] Error at step {self.recipe_step_index}: {e}")
             self.time_remaining_label.setText("Failed")
-            QMessageBox.critical(
+            await msgbox('critical', 
                 self,
                 "Recipe Failed",
                 f"Recipe failed at step {self.recipe_step_index}:\n\n{e}"
