@@ -526,6 +526,12 @@ class ALDMainWindow(QMainWindow):
         self.reset_btn.setStyleSheet("background-color: #e67e22; color: white; font-weight: bold; padding: 5px;")
         self.reset_btn.setEnabled(False)
         conn_layout.addWidget(self.reset_btn)
+
+        self.heaters_off_btn = QPushButton("Heaters Off")
+        self.heaters_off_btn.clicked.connect(self.heaters_off)
+        self.heaters_off_btn.setStyleSheet("background-color: #e67e22; color: white; font-weight: bold; padding: 5px;")
+        self.heaters_off_btn.setEnabled(False)
+        conn_layout.addWidget(self.heaters_off_btn)
         
         conn_layout.addStretch()
         conn_widget = QWidget()
@@ -1301,6 +1307,7 @@ class ALDMainWindow(QMainWindow):
             self.disconnect_btn.setEnabled(True)
             self.estop_btn.setEnabled(True)
             self.reset_btn.setEnabled(True)
+            self.heaters_off_btn.setEnabled(True)
             self.start_data_logging()
             self.pressure_ema = None
             self.spike_detector = SpikeDetector(self.pressure_spike_threshold)
@@ -1328,6 +1335,7 @@ class ALDMainWindow(QMainWindow):
             self.disconnect_btn.setEnabled(False)
             self.estop_btn.setEnabled(False)
             self.reset_btn.setEnabled(False)
+            self.heaters_off_btn.setEnabled(False)
             self.valve_job_running = False
             self.job_timer.stop()
             self.operation_in_progress = False
@@ -1503,6 +1511,15 @@ class ALDMainWindow(QMainWindow):
         finally:
             self.operation_in_progress = False
     
+    @asyncSlot()
+    async def heaters_off(self):
+        """All heaters off; Arduino replies 'HEATERS OFF', handled in handle_arduino_status"""
+        try:
+            await self.controller.heaters_off()
+            self.log_command('HEATERS_OFF', 'h', 'All heaters off')
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+
     @asyncSlot()
     async def emergency_stop(self):
         """Send emergency stop command to Arduino - LOCKS SYSTEM"""

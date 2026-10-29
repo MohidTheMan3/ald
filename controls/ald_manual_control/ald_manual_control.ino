@@ -148,6 +148,7 @@ const int OVERTEMP_MARGIN_C = 50;      // reading > setpoint + this -> heaters o
 
 unsigned long last_activity_ms = 0;
 int tc_fail_count[4] = {0};
+uint8_t tc_last_err[4] = {0};   // MAX31855 fault bits: 1=open, 2=short to GND, 4=short to VCC
 const char *TC_NAMES[4] = {"substrate", "delivery", "prec1", "prec2"};
 
 // -------------------- Standard hysteresis values ----------
@@ -302,6 +303,7 @@ void readThermocouples()
     // sensor can't leave its heater running on a frozen reading.
     if (isnan(curr_val)) {
       if (tc_fail_count[i] < 1000) tc_fail_count[i]++;
+      tc_last_err[i] = thermocouples[i].readError();
     } else {
       tc_fail_count[i] = 0;
       current_reading[i] = curr_val;
@@ -673,7 +675,9 @@ void actuateHeatingElements()
   {
     // A faulted sensor only matters if its heater is in use.
     if (sets[i] > 0 && tc_fail_count[i] >= TC_FAULT_LIMIT) {
-      heatersOff(String(F("thermocouple fault on ")) + TC_NAMES[i]);
+      uint8_t e = tc_last_err[i];
+      heatersOff(String(F("thermocouple fault on ")) + TC_NAMES[i] +
+                 (e & 1 ? F(" (open circuit)") : e & 2 ? F(" (short to GND)") : e & 4 ? F(" (short to VCC)") : F(" (no reading)")));
       return;
     }
     if (sets[i] > 0 && avgs[i] > sets[i] + OVERTEMP_MARGIN_C) {
@@ -1006,6 +1010,10 @@ void loop()
       digitalWrite(RELAY_VALVE3_PIN, LOW);
 
       while (1) { }
+    }
+    else if (s[0] == 'h')
+    {
+      heatersOff(F("heaters off command"));   // normal stop; next 't' turns control back on
     }
     else if (s[0] == 'r')
     {

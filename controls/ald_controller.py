@@ -201,6 +201,10 @@ class ALDController:
         await self.send("s")
         self.logger.critical("EMERGENCY STOP - System locked, Arduino needs restart")
     
+    async def heaters_off(self):
+        """Turn all heaters off (not a lockout; the next temp command re-enables control)"""
+        await self.send("h")
+
     async def keepalive(self):
         """Reset the Arduino's idle-timeout timer without changing anything"""
         await self.send("k")
