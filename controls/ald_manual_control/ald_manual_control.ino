@@ -148,7 +148,13 @@ const int OVERTEMP_MARGIN_C = 50;      // reading > setpoint + this -> heaters o
 
 unsigned long last_activity_ms = 0;
 int tc_fail_count[4] = {0};
-uint8_t tc_last_err[4] = {0};   // MAX31855 fault bits: 1=open, 2=short to GND, 4=short to VCC
+uint8_t tc_last_err[4] = {0};
+// Thermocouple-fault bypass ('i1' on, 'i0' off). Off at boot. The GUI must
+// resend 'i1' at least every TC_BYPASS_TTL_MS or it switches itself off,
+// so it can't outlive the GUI session. Overtemp and idle checks still apply.
+bool tc_fault_bypass = false;
+unsigned long tc_bypass_seen_ms = 0;
+const unsigned long TC_BYPASS_TTL_MS = 90000;   // MAX31855 fault bits: 1=open, 2=short to GND, 4=short to VCC
 const char *TC_NAMES[4] = {"substrate", "delivery", "prec1", "prec2"};
 
 // -------------------- Standard hysteresis values ----------
@@ -669,12 +675,16 @@ void actuateHeatingElements()
   if (!tc_active) return;
 
   // ---------------- Safety checks (independent of the GUI) ----------------
+  if (tc_fault_bypass && millis() - tc_bypass_seen_ms >= TC_BYPASS_TTL_MS) {
+    tc_fault_bypass = false;
+    Serial.println(F("TC FAULT BYPASS EXPIRED (no GUI heartbeat) - fault checks back on"));
+  }
   double avgs[4] = {temp_substrate_avg, temp_delivery_avg, temp_prec1_avg, temp_prec2_avg};
   int sets[4]    = {temp_set_substrate, temp_set_delivery, temp_set_prec1, temp_set_prec2};
   for (int i = 0; i < 4; i++)
   {
     // A faulted sensor only matters if its heater is in use.
-    if (sets[i] > 0 && tc_fail_count[i] >= TC_FAULT_LIMIT) {
+    if (sets[i] > 0 && tc_fail_count[i] >= TC_FAULT_LIMIT && !tc_fault_bypass) {
       uint8_t e = tc_last_err[i];
       heatersOff(String(F("thermocouple fault on ")) + TC_NAMES[i] +
                  (e & 1 ? F(" (open circuit)") : e & 2 ? F(" (short to GND)") : e & 4 ? F(" (short to VCC)") : F(" (no reading)")));
@@ -986,6 +996,17 @@ void loop()
     char s[100] = {0};
     String inputString = Serial.readStringUntil('\n');
     inputString.toCharArray(s, sizeof(s));   // bounded copy; strcpy overflowed on long lines
+
+    // Bypass heartbeat: handled before the idle-timer reset on purpose, so an
+    // open-but-unattended GUI can't keep heaters on forever.
+    if (s[0] == 'i') {
+      bool on = (s[1] == '1');
+      if (on) tc_bypass_seen_ms = millis();
+      if (on != tc_fault_bypass)
+        Serial.println(on ? F("WARNING: TC FAULT BYPASS ON") : F("TC FAULT BYPASS OFF"));
+      tc_fault_bypass = on;
+      return;
+    }
 
     // Any command counts as operator/recipe activity for the idle timeout.
     last_activity_ms = millis();
