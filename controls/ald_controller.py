@@ -205,9 +205,9 @@ class ALDController:
         """Turn all heaters off (not a lockout; the next temp command re-enables control)"""
         await self.send("h")
 
-    async def tc_fault_bypass(self, on):
-        """Ignore thermocouple faults; must be resent every <90 s or the Arduino drops it"""
-        await self.send("i1" if on else "i0")
+    async def tc_fault_bypass(self, mode):
+        """0 = off, 1 = hold faulted heater, 2 = keep heating. Resend every <90 s or the Arduino drops it."""
+        await self.send(f"i{int(mode)}")
 
     async def keepalive(self):
         """Reset the Arduino's idle-timeout timer without changing anything"""

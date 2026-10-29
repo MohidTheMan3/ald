@@ -11,7 +11,7 @@ import winsound
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QLabel, QLineEdit, QPushButton, 
                             QTextEdit, QTabWidget, QGroupBox, QMessageBox, QFileDialog,
-                            QInputDialog, QProgressBar, QGridLayout, QScrollArea, QCheckBox)
+                            QInputDialog, QProgressBar, QGridLayout, QScrollArea, QComboBox)
 from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtGui import QColor, QPalette, QPen
 from PyQt6.QtCharts import QChart, QChartView, QLineSeries, QValueAxis, QDateTimeAxis
@@ -422,7 +422,8 @@ class ALDMainWindow(QMainWindow):
 
         if "bypass expired" in msg_lower:
             self.tc_bypass_timer.stop()
-            self.tc_bypass_cb.setChecked(False)
+            self.tc_bypass_cb.setCurrentIndex(0)
+            self.tc_bypass_mode = 0
             self.log_text.append(f"[WARNING] {msg}")
             return
 
@@ -560,10 +561,15 @@ class ALDMainWindow(QMainWindow):
         self.heaters_off_btn.setEnabled(False)
         conn_layout.addWidget(self.heaters_off_btn)
 
-        self.tc_bypass_cb = QCheckBox("Ignore TC faults")
+        # Index = firmware mode sent as i<index>
+        self.tc_bypass_mode = 0
+        self.tc_bypass_cb = QComboBox()
+        self.tc_bypass_cb.addItems(["TC fault: shut off all heaters",
+                                    "TC fault: hold only that heater",
+                                    "TC fault: IGNORE, keep heating"])
         self.tc_bypass_cb.setStyleSheet("color: #c0392b; font-weight: bold;")
         self.tc_bypass_cb.setEnabled(False)
-        self.tc_bypass_cb.clicked.connect(self.toggle_tc_bypass)
+        self.tc_bypass_cb.activated.connect(self.toggle_tc_bypass)   # user picks only, not setCurrentIndex
         conn_layout.addWidget(self.tc_bypass_cb)
         self.tc_bypass_timer = QTimer()
         self.tc_bypass_timer.timeout.connect(self.send_tc_bypass)
@@ -1373,7 +1379,8 @@ class ALDMainWindow(QMainWindow):
             self.reset_btn.setEnabled(False)
             self.heaters_off_btn.setEnabled(False)
             self.tc_bypass_cb.setEnabled(False)
-            self.tc_bypass_cb.setChecked(False)
+            self.tc_bypass_cb.setCurrentIndex(0)
+            self.tc_bypass_mode = 0
             self.tc_bypass_timer.stop()   # Arduino drops the bypass ~90 s later
             self.valve_job_running = False
             self.job_timer.stop()
@@ -1551,35 +1558,37 @@ class ALDMainWindow(QMainWindow):
         finally:
             self.operation_in_progress = False
     
-    @asyncSlot(bool)  # clicked(bool) passes the new checked state
-    async def toggle_tc_bypass(self, checked):
-        if checked:
-            reply = await msgbox('warning', 
-                self, "Ignore thermocouple faults?",
-                "Heaters will keep running on the LAST GOOD reading of a faulted thermocouple "
-                "(it may be frozen and below setpoint).\n\n"
-                "Only use this while watching temperature with another instrument.\n"
-                "Turns off when unchecked, on disconnect, or ~90 s after the GUI stops.",
+    @asyncSlot(int)
+    async def toggle_tc_bypass(self, mode):
+        warnings = {
+            1: "A heater whose thermocouple faults is held OFF until it reads normally again.\n"
+               "Other heaters keep working.",
+            2: "Heaters keep running on the LAST GOOD reading of a faulted thermocouple.\n"
+               "That reading may be frozen below setpoint, so the heater may NOT turn off by itself.\n\n"
+               "Only use this while watching temperature with another instrument.",
+        }
+        if mode in warnings:
+            reply = await msgbox('warning', self, "Change thermocouple fault handling?",
+                warnings[mode] + "\n\nReverts on disconnect or ~90 s after the GUI stops.",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No)
             if reply != QMessageBox.StandardButton.Yes:
-                self.tc_bypass_cb.setChecked(False)
+                self.tc_bypass_cb.setCurrentIndex(self.tc_bypass_mode)
                 return
-            self.tc_bypass_timer.start(30000)
-        else:
-            self.tc_bypass_timer.stop()
         try:
-            await self.controller.tc_fault_bypass(checked)
-            self.log_command('TC_BYPASS', 'i1' if checked else 'i0', 'Ignore TC faults ' + ('ON' if checked else 'OFF'))
+            await self.controller.tc_fault_bypass(mode)
+            self.tc_bypass_mode = mode
+            if mode: self.tc_bypass_timer.start(30000)
+            else: self.tc_bypass_timer.stop()
+            self.log_command('TC_BYPASS', f'i{mode}', self.tc_bypass_cb.itemText(mode))
         except Exception as e:
-            self.tc_bypass_timer.stop()
-            self.tc_bypass_cb.setChecked(False)
+            self.tc_bypass_cb.setCurrentIndex(self.tc_bypass_mode)
             await msgbox('critical', self, "Error", str(e))
 
     @asyncSlot()
     async def send_tc_bypass(self):
         try:
-            await self.controller.tc_fault_bypass(True)
+            await self.controller.tc_fault_bypass(self.tc_bypass_mode)
         except Exception as e:
             self.log_text.append(f"[WARNING] TC bypass heartbeat failed: {e}")
 

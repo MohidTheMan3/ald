@@ -153,6 +153,7 @@ uint8_t tc_last_err[4] = {0};
 // resend 'i1' at least every TC_BYPASS_TTL_MS or it switches itself off,
 // so it can't outlive the GUI session. Overtemp and idle checks still apply.
 bool tc_fault_bypass = false;
+bool tc_bypass_keep_heating = false;      // 'i2': no per-heater hold either; heats on last good reading
 unsigned long tc_bypass_seen_ms = 0;
 const unsigned long TC_BYPASS_TTL_MS = 90000;
 // In bypass, a faulted TC holds only ITS heater off until it reads normally again.
@@ -691,6 +692,7 @@ void actuateHeatingElements()
   // ---------------- Safety checks (independent of the GUI) ----------------
   if (tc_fault_bypass && millis() - tc_bypass_seen_ms >= TC_BYPASS_TTL_MS) {
     tc_fault_bypass = false;
+    tc_bypass_keep_heating = false;
     Serial.println(F("TC FAULT BYPASS EXPIRED (no GUI heartbeat) - fault checks back on"));
   }
   double avgs[4] = {temp_substrate_avg, temp_delivery_avg, temp_prec1_avg, temp_prec2_avg};
@@ -715,7 +717,7 @@ void actuateHeatingElements()
   // ---------------- Bypass: per-heater hold on bad readings ----------------
   for (int i = 0; i < 4; i++)
   {
-    bool want_hold = tc_fault_bypass && sets[i] > 0 &&
+    bool want_hold = tc_fault_bypass && !tc_bypass_keep_heating && sets[i] > 0 &&
                      (heater_held[i] ? tc_good_count[i] < TC_RECOVER_READS : tc_fail_count[i] > 0);
     if (want_hold == heater_held[i]) continue;
     heater_held[i] = want_hold;
@@ -1045,11 +1047,16 @@ void loop()
     // Bypass heartbeat: handled before the idle-timer reset on purpose, so an
     // open-but-unattended GUI can't keep heaters on forever.
     if (s[0] == 'i') {
-      bool on = (s[1] == '1');
+      // i0 = off, i1 = hold faulted heater, i2 = ignore faults and keep heating
+      bool on = (s[1] == '1' || s[1] == '2');
+      bool keep = (s[1] == '2');
       if (on) tc_bypass_seen_ms = millis();
-      if (on != tc_fault_bypass)
-        Serial.println(on ? F("WARNING: TC FAULT BYPASS ON") : F("TC FAULT BYPASS OFF"));
+      if (on != tc_fault_bypass || keep != tc_bypass_keep_heating)
+        Serial.println(keep ? F("WARNING: TC FAULT BYPASS ON - KEEP HEATING (no hold)")
+                     : on ? F("WARNING: TC FAULT BYPASS ON - HOLD FAULTED HEATER")
+                          : F("TC FAULT BYPASS OFF"));
       tc_fault_bypass = on;
+      tc_bypass_keep_heating = keep;
       return;
     }
 
