@@ -18,8 +18,16 @@
 //     Pulse one valve for the requested number of pulse/purge cycles.
 //   r
 //     Reset valve command state.
+//   k
+//     Keepalive (sent by the GUI while a recipe runs). Resets the idle timer only.
 //   s
 //     Emergency stop: turn heaters off, close valves, then halt.
+//
+// Safety shutoffs (heaters off, valves untouched; send a new 't' to re-enable):
+//   - no command received for IDLE_TIMEOUT_MS
+//   - a thermocouple reads NaN (open/shorted) TC_FAULT_LIMIT times in a row
+//   - an active heater's reading exceeds its setpoint by OVERTEMP_MARGIN_C
+// Each prints a line containing "HEATERS OFF" so the GUI can react.
 //
 // Relay convention used throughout this file:
 //   Heater relays are active LOW: LOW = ON, HIGH = OFF.
@@ -97,7 +105,8 @@ unsigned long lastPressureSend = 0;
 unsigned long lastFlowSend = 0;
 
 const unsigned long TEMP_INTERVAL_MS = 500;
-const unsigned long PRESSURE_INTERVAL_MS = 500;
+// 10 Hz so the GUI can resolve the rise/fall of each individual pulse.
+const unsigned long PRESSURE_INTERVAL_MS = 100;
 const unsigned long FLOW_INTERVAL_MS = 1000;
 
 // -------------------- Thermocouple buffers -----------------
@@ -131,6 +140,15 @@ int last_temp_set_prec1 = -999;
 int last_temp_set_prec2 = -999;
 
 int tc_active = 0;
+
+// -------------------- Safety shutoff tuning ----------------
+const unsigned long IDLE_TIMEOUT_MS = 60UL * 60UL * 1000UL;  // 60 min with no command -> heaters off
+const int TC_FAULT_LIMIT = 6;          // consecutive NaN reads (~3 s at 500 ms) -> heaters off
+const int OVERTEMP_MARGIN_C = 50;      // reading > setpoint + this -> heaters off (matches GUI rule)
+
+unsigned long last_activity_ms = 0;
+int tc_fail_count[4] = {0};
+const char *TC_NAMES[4] = {"substrate", "delivery", "prec1", "prec2"};
 
 // -------------------- Standard hysteresis values ----------
 const int HYSTERESIS_PREC1 = 0;
@@ -222,7 +240,8 @@ const unsigned long substrate_lockout_ms = 2000;
 // ============================================================
 // Pressure smoothing buffer
 // ============================================================
-const int PRESSURE_AVG_WINDOW = 5;
+// 3 samples at 10 Hz = 0.3 s smoothing. Larger flattens individual pulse spikes.
+const int PRESSURE_AVG_WINDOW = 3;
 double pressure_history[PRESSURE_AVG_WINDOW] = {0};
 int pressure_idx = 0;
 int pressure_count = 0;
@@ -265,9 +284,9 @@ void setup()
     thermocouples[i].begin();
 
   while (!Serial)
-    Serial.println("Waiting for serial...");
+    Serial.println(F("Waiting for serial..."));
 
-  Serial.println("Setup complete!");
+  Serial.println(F("Setup complete!"));
 }
 
 // ============================================================
@@ -279,8 +298,14 @@ void readThermocouples()
   {
     double curr_val = thermocouples[i].readCelsius();
 
-    if (!isnan(curr_val))
+    // Keep the last good value for display, but count faults so a dead
+    // sensor can't leave its heater running on a frozen reading.
+    if (isnan(curr_val)) {
+      if (tc_fail_count[i] < 1000) tc_fail_count[i]++;
+    } else {
+      tc_fail_count[i] = 0;
       current_reading[i] = curr_val;
+    }
   }
 
   // Consistent physical mapping:
@@ -357,6 +382,31 @@ void resetPrecursorControlState(
   pulse_start_ms = 0;
   last_pulse_end_ms = millis();
   current_pulse_on_ms = 700;
+}
+
+// ============================================================
+// Safety shutoff: all heaters OFF, controller disabled until next 't'.
+// Precursor state is reset too, otherwise a heater can be left with
+// pulse_mode=true and relay off, and never turn back on.
+// ============================================================
+void heatersOff(const String &reason)
+{
+  digitalWrite(RELAY_SUBSTRATE_PIN, HIGH);
+  digitalWrite(RELAY_DELIVERY_PIN, HIGH);
+  relay_substrate_on = false;
+  relay_delivery_on = false;
+
+  resetPrecursorControlState(relay_prec1_on, prec1_startup_mode, prec1_startup_pulse_stage,
+      prec1_peak_seen, prec1_temp_rising, prec1_pulse_mode, prec1_force_recovery_mode,
+      prec1_peak_temp, prec1_last_switch_ms, prec1_pulse_start_ms, prec1_last_pulse_end_ms,
+      prec1_current_pulse_on_ms, RELAY_PREC1_PIN);
+  resetPrecursorControlState(relay_prec2_on, prec2_startup_mode, prec2_startup_pulse_stage,
+      prec2_peak_seen, prec2_temp_rising, prec2_pulse_mode, prec2_force_recovery_mode,
+      prec2_peak_temp, prec2_last_switch_ms, prec2_pulse_start_ms, prec2_last_pulse_end_ms,
+      prec2_current_pulse_on_ms, RELAY_PREC2_PIN);
+
+  tc_active = 0;
+  Serial.println("SAFETY: " + reason + " - HEATERS OFF");
 }
 
 // ============================================================
@@ -616,6 +666,26 @@ void actuateHeatingElements()
   // Only actuate after temperature command has been received
   if (!tc_active) return;
 
+  // ---------------- Safety checks (independent of the GUI) ----------------
+  double avgs[4] = {temp_substrate_avg, temp_delivery_avg, temp_prec1_avg, temp_prec2_avg};
+  int sets[4]    = {temp_set_substrate, temp_set_delivery, temp_set_prec1, temp_set_prec2};
+  for (int i = 0; i < 4; i++)
+  {
+    // A faulted sensor only matters if its heater is in use.
+    if (sets[i] > 0 && tc_fail_count[i] >= TC_FAULT_LIMIT) {
+      heatersOff(String(F("thermocouple fault on ")) + TC_NAMES[i]);
+      return;
+    }
+    if (sets[i] > 0 && avgs[i] > sets[i] + OVERTEMP_MARGIN_C) {
+      heatersOff(String(F("overtemp on ")) + TC_NAMES[i] + F(" (") + String(avgs[i]) + F(" C)"));
+      return;
+    }
+  }
+  if (millis() - last_activity_ms >= IDLE_TIMEOUT_MS) {
+    heatersOff("idle timeout, no command for " + String(IDLE_TIMEOUT_MS / 60000UL) + " min");
+    return;
+  }
+
   // ----------------------------------------------------------
   // Delivery line heater: peak-tracking control
   // ----------------------------------------------------------
@@ -623,19 +693,28 @@ void actuateHeatingElements()
 
   bool delivery_can_switch =
       (millis() - delivery_last_switch_ms) >= delivery_lockout_ms;
-  // Serial.print("DELIV set=");
+  // Serial.print(F("DELIV set="));
   // Serial.print(temp_set_delivery);
-  // Serial.print(" avg=");
+  // Serial.print(F(" avg="));
   // Serial.print(temp_delivery_avg);
-  // Serial.print(" rising=");
+  // Serial.print(F(" rising="));
   // Serial.print(delivery_temp_rising ? "Y" : "N");
-  // Serial.print(" armed=");
+  // Serial.print(F(" armed="));
   // Serial.print(delivery_restart_armed ? "Y" : "N");
-  // Serial.print(" fallCt=");
+  // Serial.print(F(" fallCt="));
   // Serial.print(delivery_falling_count);
-  // Serial.print(" relay=");
+  // Serial.print(F(" relay="));
   // Serial.println(relay_delivery_on ? "ON" : "OFF");
-  if (relay_delivery_on)
+  if (temp_set_delivery <= 0)
+  {
+      // Setpoint 0 = heater off. Without this, the peak-drop restart below
+      // keeps firing short heat pulses whenever the line cools slightly.
+      if (relay_delivery_on) {
+          digitalWrite(RELAY_DELIVERY_PIN, HIGH);
+          relay_delivery_on = false;
+      }
+  }
+  else if (relay_delivery_on)
   {
       // Turn off early on the way up
       if (delivery_can_switch &&
@@ -739,7 +818,7 @@ void actuateHeatingElements()
     if (substrate_can_switch &&
         temp_substrate_avg >= temp_set_substrate)
     {
-      Serial.println("SUBSTRATE -> OFF");
+      Serial.println(F("SUBSTRATE -> OFF"));
       digitalWrite(RELAY_SUBSTRATE_PIN, HIGH);   // OFF
       relay_substrate_on = false;
       substrate_last_switch_ms = millis();
@@ -750,7 +829,7 @@ void actuateHeatingElements()
     if (substrate_can_switch &&
         temp_substrate_avg < temp_set_substrate)
     {
-      Serial.println("SUBSTRATE -> ON");
+      Serial.println(F("SUBSTRATE -> ON"));
       digitalWrite(RELAY_SUBSTRATE_PIN, LOW);    // ON
       relay_substrate_on = true;
       substrate_last_switch_ms = millis();
@@ -775,7 +854,8 @@ void precursorValveActuation()
         {
             digitalWrite(which_valve == 1 ? RELAY_VALVE1_PIN :
                         which_valve == 2 ? RELAY_VALVE2_PIN : RELAY_VALVE3_PIN, HIGH);
-            Serial.println("V: Pulsing valve " + String(which_valve));
+            // GUI parses this line to count lifetime pulses/open time per precursor.
+            Serial.println("V: Pulsing valve " + String(which_valve) + " " + String(pulse_time) + "ms");
             valve_timer_start = now;
             valve_state = 1;
         }
@@ -783,7 +863,7 @@ void precursorValveActuation()
         {
             digitalWrite(which_valve == 1 ? RELAY_VALVE1_PIN :
                         which_valve == 2 ? RELAY_VALVE2_PIN : RELAY_VALVE3_PIN, LOW);
-            Serial.println("V: Purging line");
+            Serial.println(F("V: Purging line"));
             valve_timer_start = now;
             valve_state = 2;
         }
@@ -836,7 +916,7 @@ void readCVM211PressureTorr()
   for (int i = 0; i < pressure_count; i++) sum += pressure_history[i];
   double avg = sum / pressure_count;
 
-  if (P_Torr > 100)
+  if (avg > 100000.0)   // pick the unit from the value actually printed
     Serial.println("P: " + String(avg / 1000.0) + " Torr");
   else
     Serial.println("P: " + String(avg) + " mTorr");
@@ -899,17 +979,22 @@ void loop()
 
   if (Serial.available() > 0)
   {
-    Serial.println("Got command!");
     char s[100] = {0};
     String inputString = Serial.readStringUntil('\n');
-    strcpy(s, inputString.c_str());
+    inputString.toCharArray(s, sizeof(s));   // bounded copy; strcpy overflowed on long lines
 
+    // Any command counts as operator/recipe activity for the idle timeout.
+    last_activity_ms = millis();
+
+    if (s[0] == 'k') return;   // keepalive: silent, nothing else to do
+
+    Serial.println(F("Got command!"));
     Serial.println(s);
     int result = 0;
 
     if (s[0] == 's')
     {
-      Serial.println("EMERGENCY STOP command received! Closing all valves, stopping heating.");
+      Serial.println(F("EMERGENCY STOP command received! Closing all valves, stopping heating."));
 
       digitalWrite(RELAY_SUBSTRATE_PIN, HIGH);
       digitalWrite(RELAY_DELIVERY_PIN, HIGH);
@@ -926,13 +1011,12 @@ void loop()
     {
       num_pulse = 0;
       which_valve = 0;
-      Serial.println("RESET command received! Resetting state!");
+      Serial.println(F("RESET command received! Resetting state!"));
     }
     else
     {
       if (s[0] == 't')
       {
-        tc_active = 1;
         result = sscanf(
           s,
           "t%d;%d;%d;%d",
@@ -941,16 +1025,19 @@ void loop()
           &temp_set_prec2,
           &temp_set_substrate
         );
-      Serial.print("SETPOINTS:");
-      Serial.print(temp_set_delivery); Serial.print(",");
-      Serial.print(temp_set_prec1); Serial.print(",");
-      Serial.print(temp_set_prec2); Serial.print(",");
+        // A partial parse may have overwritten some setpoints; don't heat on those.
+        if (result != 4) heatersOff(F("misformatted temperature command"));
+        else tc_active = 1;
+      Serial.print(F("SETPOINTS:"));
+      Serial.print(temp_set_delivery); Serial.print(F(","));
+      Serial.print(temp_set_prec1); Serial.print(F(","));
+      Serial.print(temp_set_prec2); Serial.print(F(","));
       Serial.println(temp_set_substrate);
 
       // Reset precursor controller state whenever either precursor setpoint changes.
       // This makes small changes like 83 C -> 88 C retrigger startup/pulse logic.
       if (last_temp_set_prec1 != -999 && temp_set_prec1 != last_temp_set_prec1) {
-        Serial.println("PREC1 setpoint changed: resetting precursor 1 control state");
+        Serial.println(F("PREC1 setpoint changed: resetting precursor 1 control state"));
         resetPrecursorControlState(
           relay_prec1_on,
           prec1_startup_mode,
@@ -969,7 +1056,7 @@ void loop()
       }
 
       if (last_temp_set_prec2 != -999 && temp_set_prec2 != last_temp_set_prec2) {
-        Serial.println("PREC2 setpoint changed: resetting precursor 2 control state");
+        Serial.println(F("PREC2 setpoint changed: resetting precursor 2 control state"));
         resetPrecursorControlState(
           relay_prec2_on,
           prec2_startup_mode,
@@ -995,37 +1082,45 @@ void loop()
       {
         if (busy)
         {
-          Serial.println("COMMAND IGNORED. Wait for previous command to finish, or issue RESET.");
+          Serial.println(F("COMMAND IGNORED. Wait for previous command to finish, or issue RESET."));
+          return;
         }
-        else
+        busy = true;
+        result = sscanf(
+          s,
+          "v%u;%u;%u;%u",
+          &which_valve,
+          &num_pulse,
+          &pulse_time,
+          &purge_time
+        );
+        // A partial parse used to leave num_pulse set, so the valve fired with
+        // stale timing. Reject anything not fully valid before it can actuate.
+        if (result != 4 || which_valve < 1 || which_valve > 3)
         {
-          busy = true;
-          result = sscanf(
-            s,
-            "v%u;%u;%u;%u",
-            &which_valve,
-            &num_pulse,
-            &pulse_time,
-            &purge_time
-          );
-        active_pgauge_samples = max(10, min(50, (int)(pulse_time / 10)));
+          num_pulse = 0;
+          busy = false;
+          if (result == 4) {
+            Serial.println(F("INVALID VALVE ID!"));
+            return;
+          }
         }
       }
       else
       {
-        Serial.println("INVALID COMMAND!");
+        Serial.println(F("INVALID COMMAND!"));
         return;
       }
 
       if (result != 4)
       {
-        Serial.println("MISFORMATTED COMMAND! sscanf result: ");
+        Serial.println(F("MISFORMATTED COMMAND! sscanf result: "));
         Serial.println(result);
         return;
       }
       else
       {
-        Serial.println("Starting command!");
+        Serial.println(F("Starting command!"));
       }
     }
   }
@@ -1035,7 +1130,7 @@ void loop()
   if (num_pulse == 0)
   {
     busy = false;
-    if (busy_prev) Serial.println("Previous command has completed. Ready for new command.");
+    if (busy_prev) Serial.println(F("Previous command has completed. Ready for new command."));
   }
 
   if (now - lastTempSend >= TEMP_INTERVAL_MS)
@@ -1049,7 +1144,11 @@ void loop()
   {
     lastPressureSend = now;
 
-    if (!busy || valve_state == 1) {
+    // Previously pressure was only read while idle or during the open pulse,
+    // so the purge window (where each pulse's spike shows up) was never sampled
+    // and only the final spike after the command was visible. Now we skip only
+    // the open pulse, to keep pulse timing tight.
+    if (valve_state != 1) {
       readCVM211PressureTorr();
     }
   }

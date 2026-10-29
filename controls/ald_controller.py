@@ -133,19 +133,19 @@ class ALDController:
                 if self.reader and self.reader._transport:
                     # Use a short sleep instead of wait_for to avoid re-entrancy
                     if self.reader._buffer:
-                        try:
-                            data = await self.reader.readline()
-                            msg = data.decode('utf-8', errors='ignore').strip()
-                            if msg:
-                                self.logger.info(f"Received: {msg}")
-                                self._message_queue.put_nowait(msg)
-                        except Exception:
-                            pass
+                        data = await self.reader.readline()
+                        msg = data.decode('utf-8', errors='ignore').strip()
+                        if msg:
+                            self.logger.info(f"Received: {msg}")
+                            self._message_queue.put_nowait(msg)
             except asyncio.CancelledError:
                 break
             except Exception as e:
+                # e.g. USB unplugged. Used to be swallowed, leaving the GUI showing
+                # "Connected" with no data. Mark disconnected so the GUI can tell.
                 if self.connected:
-                    self.logger.error(f"Read error: {e}")
+                    self.logger.error(f"Read error, connection lost: {e}")
+                    self.connected = False
                 break
             await asyncio.sleep(0.01)
     
@@ -201,6 +201,10 @@ class ALDController:
         await self.send("s")
         self.logger.critical("EMERGENCY STOP - System locked, Arduino needs restart")
     
+    async def keepalive(self):
+        """Reset the Arduino's idle-timeout timer without changing anything"""
+        await self.send("k")
+
     async def reset(self):
         """Reset pulse counter without emergency stop"""
         await self.send("r")

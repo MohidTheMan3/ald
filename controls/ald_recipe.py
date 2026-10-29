@@ -3,6 +3,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Dict
 
+# Absolute so recipes are found no matter which folder the GUI is launched from.
+RECIPES_DIR = Path(__file__).parent / "recipes"
+
 class Recipe:
     def __init__(self, name: str, description: str = "", cycles: int = 1):
         self.name = name
@@ -64,9 +67,9 @@ class Recipe:
     def save(self, filename: str = None):
         """Save recipe to JSON file"""
         if filename is None:
-            filename = f"recipes/{self.name.replace(' ', '_')}.json"
+            filename = RECIPES_DIR / f"{self.name.replace(' ', '_')}.json"
         
-        Path("recipes").mkdir(exist_ok=True)
+        RECIPES_DIR.mkdir(exist_ok=True)
         
         with open(filename, 'w') as f:
             json.dump(self.to_dict(), f, indent=2)
@@ -81,10 +84,9 @@ class Recipe:
     @staticmethod
     def list_recipes() -> List[str]:
         """List all available recipe files"""
-        recipes_dir = Path("recipes")
-        if not recipes_dir.exists():
+        if not RECIPES_DIR.exists():
             return []
-        return [f.stem for f in recipes_dir.glob("*.json")]
+        return sorted(f.stem for f in RECIPES_DIR.glob("*.json"))
     
     def get_summary(self) -> str:
         """Get a text summary of the recipe"""

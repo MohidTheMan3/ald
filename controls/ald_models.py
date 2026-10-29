@@ -30,8 +30,8 @@ class ValveCommand(BaseModel):
     def check_purge_time(cls, v):
         if v < 0:
             raise ValueError('Purge time cannot be negative')
-        if v > 15000:
-            raise ValueError('Purge time too long (max 15s)')
+        if v > 60000:  # firmware stores ms in a 16-bit unsigned int (max 65535)
+            raise ValueError('Purge time too long (max 60s)')
         return v
 
 class TempCommand(BaseModel):

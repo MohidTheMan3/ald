@@ -1,8 +1,12 @@
 import sys
 import asyncio
 import csv
+import json
+import os
+import re
 from datetime import datetime, timedelta
 from collections import deque
+from pathlib import Path
 import winsound
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QLabel, QLineEdit, QPushButton, 
@@ -16,7 +20,92 @@ from pydantic import ValidationError
 
 from ald_controller import ALDController
 from ald_models import ValveCommand, TempCommand
-from ald_recipe import Recipe
+from ald_recipe import Recipe, RECIPES_DIR
+
+USAGE_FILE = Path(__file__).parent / "precursor_usage.json"
+PULSE_MSG = re.compile(r'V: Pulsing valve (\d) (\d+)ms')
+
+
+def validate_step(step):
+    """Raise ValueError if a recipe step is invalid (pydantic's ValidationError is a ValueError)."""
+    if step['type'] == 'valve':
+        ValveCommand(valve_id=step['valve_id'], num_pulses=step['num_pulses'],
+                     pulse_time_ms=step['pulse_time'], purge_time_ms=step['purge_time'])
+    elif step['type'] == 'temp':
+        TempCommand(tc2=step['tc2'], tc3=step['tc3'], tc4=step['tc4'], tc5=step['tc5'])
+    elif step['type'] == 'wait':
+        if step['duration'] < 0:
+            raise ValueError("Wait duration cannot be negative")
+    else:
+        raise ValueError(f"Unknown step type {step['type']!r}")
+
+
+class SpikeDetector:
+    """Peak detector with hysteresis: a spike is a rise of more than `threshold`
+    above the last trough, confirmed once the signal falls `threshold` below its peak.
+    It measures from the trough rather than a long-term baseline, so back-to-back
+    pulses each count even when pressure never settles in between."""
+
+    def __init__(self, threshold):
+        self.threshold = threshold
+        self.trough = self.peak = None
+        self.rising = False
+
+    def update(self, v):
+        """Feed one sample. Returns (height, peak) when a spike is confirmed, else None."""
+        if self.trough is None:
+            self.trough = self.peak = v
+        elif self.rising:
+            if v > self.peak:
+                self.peak = v
+            elif v < self.peak - self.threshold:
+                result = (self.peak - self.trough, self.peak)
+                self.rising, self.trough = False, v
+                return result
+        else:
+            if v < self.trough:
+                self.trough = v
+            elif v > self.trough + self.threshold:
+                self.rising, self.peak = True, v
+        return None
+
+
+class PrecursorUsage:
+    """Per-valve pulse count and valve-open time, saved to JSON after every pulse.
+    'total_*' never resets (valve wear); '*_since_refill' resets when the bottle is refilled."""
+    FIELDS = ('total_pulses', 'total_open_ms', 'pulses_since_refill', 'open_ms_since_refill')
+
+    def __init__(self, path):
+        self.path = Path(path)
+        # A corrupt file raises instead of silently zeroing lifetime counts.
+        self.data = json.loads(self.path.read_text()) if self.path.exists() else {}
+        for v in ('1', '2', '3'):
+            entry = self.data.setdefault(v, {})
+            for f in self.FIELDS:
+                entry.setdefault(f, 0)
+            entry.setdefault('refilled', None)
+
+    def record_pulse(self, valve, pulse_ms):
+        e = self.data[str(valve)]
+        e['total_pulses'] += 1
+        e['pulses_since_refill'] += 1
+        e['total_open_ms'] += pulse_ms
+        e['open_ms_since_refill'] += pulse_ms
+        self.save()
+
+    def mark_refilled(self, valve):
+        e = self.data[str(valve)]
+        e['pulses_since_refill'] = 0
+        e['open_ms_since_refill'] = 0
+        e['refilled'] = datetime.now().isoformat(timespec='seconds')
+        self.save()
+
+    def save(self):
+        # Write-then-rename so a crash mid-write can't corrupt the file.
+        tmp = self.path.with_suffix('.tmp')
+        tmp.write_text(json.dumps(self.data, indent=2))
+        os.replace(tmp, self.path)
+
 
 class ALDMainWindow(QMainWindow):
     def __init__(self):
@@ -34,11 +123,12 @@ class ALDMainWindow(QMainWindow):
         self.pressure_log_filename = None
         self.pressure_log_counter = 0
         self.pressure_ema = None
-        self.pressure_ema_alpha = 0.5
-        self.pressure_baseline_window = deque(maxlen=200)   # 5s baseline at 10Hz
-        self.pressure_spike_threshold = 1.5                # mTorr above baseline
-        self.pressure_spike_active = False
-        self.pressure_spike_peak = 0.0
+        self.pressure_ema_alpha = 0.5        # light smoothing; firmware already averages
+        # mTorr rise/fall that counts as a pulse spike. Tune to gauge noise: the Uno's
+        # 10-bit ADC is ~1.8% of reading per step, so too low a value = false spikes.
+        self.pressure_spike_threshold = 1.5
+        self.spike_detector = SpikeDetector(self.pressure_spike_threshold)
+        self.spike_count = 0
         # Temperature data storage
         self.temp_data = {
             'tc2': deque(maxlen=2000),
@@ -78,8 +168,13 @@ class ALDMainWindow(QMainWindow):
         # Command history for optional CSV export
         self.command_history = []
         
+        # Precursor lifetime tracking
+        self.usage = PrecursorUsage(USAGE_FILE)
+
         # Recipe management
-        self.current_recipe = None
+        self.current_recipe = None   # recipe being built in the builder
+        self.loaded_recipe = None    # recipe loaded for execution (kept separate)
+        self.recipe_task = None
         self.recipe_running = False
         self.recipe_step_index = 0
         self.recipe_total_steps = 0
@@ -109,7 +204,13 @@ class ALDMainWindow(QMainWindow):
         self.status_timer = QTimer()
         self.status_timer.timeout.connect(self.update_status)
         self.status_timer.start(1000)
-        
+
+        # Keepalive so the Arduino's idle timeout doesn't trip mid-recipe
+        # (e.g. during a long temperature stabilization with no commands).
+        self.keepalive_timer = QTimer()
+        self.keepalive_timer.timeout.connect(self.send_keepalive)
+        self.keepalive_timer.start(60_000)
+
         # Timer to update graph - reduced frequency to prevent lag
         self.graph_timer = QTimer()
         self.graph_timer.timeout.connect(self.update_graph)
@@ -126,15 +227,19 @@ class ALDMainWindow(QMainWindow):
                 if len(parts) >= 2:
                     value = float(parts[0])
                     unit = parts[1]
+                    # Firmware switches to Torr near atmosphere; keep one unit so the
+                    # filter, graph and log never mix 0.76 (Torr) with 760 (mTorr).
+                    if unit == 'Torr':
+                        value *= 1000.0
+                        unit = 'mTorr'
+                    raw = value
 
-                    # Exponential moving average filter
+                    # Light EMA for display/detection
                     if self.pressure_ema is None:
                         self.pressure_ema = value
                     else:
-                        # Use faster alpha during active spike for better peak tracking
-                        # Use slower alpha during baseline for better noise rejection
-                        active_alpha = 0.4 if self.pressure_spike_active else 0.15
-                        self.pressure_ema = active_alpha * value + (1 - active_alpha) * self.pressure_ema
+                        a = self.pressure_ema_alpha
+                        self.pressure_ema = a * value + (1 - a) * self.pressure_ema
                     value = self.pressure_ema
 
                     # Store data and update graph
@@ -147,13 +252,15 @@ class ALDMainWindow(QMainWindow):
                     self.pressure_data['timestamp'].append(now)
                     self.graph_update_pending = True
 
-                    # Write to pressure log
-                    if self.pressure_log_writer is not None and self.start_time is not None:
+                    # Write to pressure log (raw value too, so post-analysis isn't
+                    # limited by the GUI's smoothing)
+                    if self.pressure_log_writer is not None:
                         time_sec = (now - self.start_time).total_seconds()
                         flow_val = self.flow_data['value'][-1] if self.flow_data['value'] else ''
                         self.pressure_log_writer.writerow([
                             now.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3],
                             f"{time_sec:.2f}",
+                            f"{raw:.4f}",
                             f"{value:.4f}",
                             unit,
                             f"{flow_val:.3f}" if flow_val != '' else ''
@@ -162,40 +269,15 @@ class ALDMainWindow(QMainWindow):
                         if self.pressure_log_counter % 60 == 0:
                             self.pressure_log_file.flush()
 
-                    # Real-time valve event detection
-                    self.pressure_baseline_window.append(value)
-                    if len(self.pressure_baseline_window) == 50:
-                        baseline = sorted(self.pressure_baseline_window)[int(len(self.pressure_baseline_window) * 0.5)]
-                        deviation = value - baseline
-
-                        if deviation > self.pressure_spike_threshold:
-                            if not self.pressure_spike_active:
-                                self.pressure_spike_active = True
-                                self.pressure_spike_peak = deviation
-                                now_str = datetime.now().strftime('%H:%M:%S')
-                                self.log_text.append(
-                                    f"[VALVE EVENT] Pressure spike detected: "
-                                    f"{deviation:.2f} mTorr above baseline at {now_str}"
-                                )
-                            else:
-                                if deviation > self.pressure_spike_peak + self.pressure_spike_threshold:
-                                    self.pressure_spike_peak = deviation
-                                    now_str = datetime.now().strftime('%H:%M:%S')
-                                    self.log_text.append(
-                                        f"[VALVE EVENT] Second pressure spike detected: "
-                                        f"{deviation:.2f} mTorr above baseline at {now_str}"
-                                    )
-                                else:
-                                    self.pressure_spike_peak = max(self.pressure_spike_peak, deviation)
-                        else:
-                            if self.pressure_spike_active:
-                                if deviation < self.pressure_spike_threshold * 0.3:
-                                    self.pressure_spike_active = False
-                                    self.pressure_spike_peak = 0.0
-                                    now_str = datetime.now().strftime('%H:%M:%S')
-                                    self.log_text.append(
-                                        f"[VALVE EVENT] Reached baseline pressure at {now_str}"
-                                    )
+                    # Per-pulse spike detection
+                    spike = self.spike_detector.update(value)
+                    if spike:
+                        self.spike_count += 1
+                        height, peak = spike
+                        self.log_text.append(
+                            f"[VALVE EVENT] Pressure spike #{self.spike_count}: "
+                            f"+{height:.2f} mTorr (peak {peak:.2f}) at {now.strftime('%H:%M:%S')}"
+                        )
 
             except (ValueError, IndexError):
                 pass
@@ -240,7 +322,8 @@ class ALDMainWindow(QMainWindow):
             await self.controller.estop()
             self.valve_job_running = False
             self.job_timer.stop()
-            
+            self.abort_recipe("overheat emergency stop")
+
             self.log_text.append("!!! EMERGENCY STOP - OVERHEAT DETECTED !!!")
             self.status_label.setText("🚨 OVERHEAT - EMERGENCY STOP")
             self.status_label.setStyleSheet("background-color: #c0392b; color: white; padding: 10px; font-weight: bold;")
@@ -308,7 +391,27 @@ class ALDMainWindow(QMainWindow):
     def handle_arduino_status(self, msg):
         """Handle status messages from Arduino"""
         msg_lower = msg.lower()
-        
+
+        pulse = PULSE_MSG.match(msg)
+        if pulse:
+            # Counted at pulse start (a RESET mid-pulse still counts as one).
+            self.usage.record_pulse(int(pulse[1]), int(pulse[2]))
+            self.update_usage_display()
+            return
+
+        if "heaters off" in msg_lower:
+            # Firmware safety shutoff (idle timeout, thermocouple fault, overtemp).
+            # Stop overheat checks against the old setpoints; the system is cooling.
+            self.temp_setpoints_initialized = False
+            self.status_label.setText(f"⚠️ {msg}")
+            self.status_label.setStyleSheet("background-color: #e67e22; color: white; padding: 10px; font-weight: bold;")
+            self.abort_recipe(msg)
+            try:
+                winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+            except Exception:
+                pass
+            return
+
         if "previous command has completed" in msg_lower or "ready for new command" in msg_lower:
             self.valve_job_running = False
             self.job_timer.stop()
@@ -318,13 +421,12 @@ class ALDMainWindow(QMainWindow):
             asyncio.get_event_loop().call_soon(self.valve_done_event.set)
         
         elif "command ignored" in msg_lower:
-            self.log_text.append(f"[DEBUG] Arduino ignored command")
-            QMessageBox.warning(
-                self,
-                "Command Ignored",
-                "Arduino is still processing previous valve command.\n\n"
-                "Wait for completion or use 'Reset Valves' button."
-            )
+            # No modal box here: it would block this handler (and the overheat
+            # check) for as long as it stays open.
+            self.log_text.append("[WARNING] Arduino ignored a valve command (still busy). "
+                                 "Wait for completion or use 'Reset Valves'.")
+            # A skipped precursor dose ruins the film, so don't let a recipe carry on.
+            self.abort_recipe("Arduino ignored a valve command")
         
         elif "emergency stop" in msg_lower and "received" in msg_lower:
             self.valve_job_running = False
@@ -341,6 +443,47 @@ class ALDMainWindow(QMainWindow):
             self.time_remaining_label.setText("--")
             self.log_text.append(f"[DEBUG] Set valve_job_running = False (reset)")
             asyncio.get_event_loop().call_soon(self.valve_done_event.set)
+
+    def update_usage_display(self):
+        for valve, label in self.usage_labels.items():
+            e = self.usage.data[str(valve)]
+            refilled = e['refilled'] or 'never'
+            label.setText(
+                f"Valve {valve}:  lifetime {e['total_pulses']:,} pulses / {e['total_open_ms'] / 1000:,.1f} s open"
+                f"   |   since refill ({refilled}): {e['pulses_since_refill']:,} pulses / "
+                f"{e['open_ms_since_refill'] / 1000:,.1f} s open"
+            )
+
+    def mark_refilled(self, valve):
+        reply = QMessageBox.question(
+            self, "Precursor Refilled",
+            f"Reset the 'since refill' counters for valve {valve}?\n\nLifetime totals are kept.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            self.usage.mark_refilled(valve)
+            self.update_usage_display()
+            self.log_text.append(f"[USAGE] Valve {valve} marked refilled")
+
+    def abort_recipe(self, reason):
+        """Cancel a running recipe. Its finally-block restores the UI state."""
+        if self.recipe_task is not None and not self.recipe_task.done():
+            self.log_text.append(f"[RECIPE] ABORTED: {reason}")
+            self.recipe_step_label.setText("Aborted")
+            self.time_remaining_label.setText("Aborted")
+            self.recipe_task.cancel()
+
+    @asyncSlot()
+    async def send_keepalive(self):
+        # Only while a recipe runs. When nobody is using the system, the Arduino's
+        # idle timeout should be allowed to shut the heaters off.
+        if self.recipe_running and self.controller.is_connected():
+            try:
+                await self.controller.keepalive()
+            except Exception as e:
+                self.log_text.append(f"[WARNING] Keepalive failed: {e}")
+
     def setup_ui(self):
         self.setWindowTitle("ALD Control System")
         self.setGeometry(100, 100, 1400, 1000)
@@ -530,7 +673,23 @@ class ALDMainWindow(QMainWindow):
         controls_layout.addWidget(sensors_group)
         
         layout.addLayout(controls_layout)
-        
+
+        # Precursor usage (lifetime + since refill), persisted in precursor_usage.json
+        usage_group = QGroupBox("Precursor Usage")
+        usage_layout = QGridLayout()
+        self.usage_labels = {}
+        for row, valve in enumerate((1, 2, 3)):
+            label = QLabel()
+            self.usage_labels[valve] = label
+            usage_layout.addWidget(label, row, 0)
+            btn = QPushButton(f"Valve {valve} Refilled")
+            btn.setMaximumWidth(140)
+            btn.clicked.connect(lambda _, v=valve: self.mark_refilled(v))
+            usage_layout.addWidget(btn, row, 1)
+        usage_group.setLayout(usage_layout)
+        layout.addWidget(usage_group)
+        self.update_usage_display()
+
         # Temperature readings with setpoint comparison - compact horizontal layout
         readings_group = QGroupBox("Temperature Readings (Current → Setpoint → Delta)")
         readings_layout = QHBoxLayout()
@@ -1045,7 +1204,8 @@ class ALDMainWindow(QMainWindow):
             
             # Play alarm sound
             try:
-                winsound.Beep(1000, 500)  # 1000 Hz for 500ms
+                # MessageBeep is async; Beep() blocked the GUI (and serial processing) for 0.5 s
+                winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
             except Exception as e:
                 print(f"Could not play alarm sound: {e}")
 
@@ -1143,9 +1303,8 @@ class ALDMainWindow(QMainWindow):
             self.reset_btn.setEnabled(True)
             self.start_data_logging()
             self.pressure_ema = None
-            self.pressure_spike_active = False
-            self.pressure_spike_peak = 0.0
-            self.pressure_baseline_window.clear()
+            self.spike_detector = SpikeDetector(self.pressure_spike_threshold)
+            self.spike_count = 0
             self.log_text.append(f"Connected to {port}")
         except Exception as e:
             QMessageBox.critical(self, "Connection Error", f"Failed to connect: {e}")
@@ -1154,6 +1313,8 @@ class ALDMainWindow(QMainWindow):
     
     @asyncSlot()
     async def disconnect_arduino(self):
+        self.disconnect_btn.setEnabled(False)  # so update_status doesn't report this as a lost connection
+        self.abort_recipe("disconnected")
         self.operation_in_progress = True
         try:
             await self.controller.disconnect()
@@ -1204,21 +1365,8 @@ class ALDMainWindow(QMainWindow):
             num_pulses = int(num_pulses_text)
             pulse_time = int(pulse_time_text)
             purge_time = int(purge_time_text)
-            
-            # Range validation
-            if valve_id < 1 or valve_id > 3:
-                QMessageBox.warning(self, "Input Error", "Valve ID must be 1, 2, or 3")
-                return
-            if num_pulses < 1 or num_pulses > 10000:
-                QMessageBox.warning(self, "Input Error", "Number of pulses must be between 1 and 10000")
-                return
-            if pulse_time < 1 or pulse_time > 60000:
-                QMessageBox.warning(self, "Input Error", "Pulse time must be between 1 and 60000 ms")
-                return
-            if purge_time < 0 or purge_time > 60000:
-                QMessageBox.warning(self, "Input Error", "Purge time must be between 0 and 60000 ms")
-                return
-                
+            # Range limits live in one place: ValveCommand (ald_models.py),
+            # checked by controller.valve() below.
         except ValueError:
             QMessageBox.warning(self, "Input Error", "Please enter valid whole numbers for all valve fields.")
             return
@@ -1378,6 +1526,7 @@ class ALDMainWindow(QMainWindow):
                 await self.controller.estop()
                 self.job_timer.stop()
                 self.valve_job_running = False
+                self.abort_recipe("emergency stop")
                 self.log_text.append("!!! EMERGENCY STOP TRIGGERED !!!")
                 self.log_text.append("!!! ARDUINO LOCKED - RESTART REQUIRED !!!")
                 self.status_label.setText("🚨 EMERGENCY STOP - Arduino Locked")
@@ -1439,6 +1588,12 @@ class ALDMainWindow(QMainWindow):
                 if "Not Connected" in self.status_label.text():
                     self.status_label.setText(f"Connected to {self.port_input.text()}")
                     self.status_label.setStyleSheet("background-color: #27ae60; color: white; padding: 10px; font-weight: bold;")
+            elif self.disconnect_btn.isEnabled() and "CONNECTION LOST" not in self.status_label.text():
+                # Controller dropped the link (e.g. USB unplugged) while the UI thought it was up.
+                self.status_label.setText("🚨 CONNECTION LOST - heaters are under Arduino control only. Click Disconnect, then reconnect.")
+                self.status_label.setStyleSheet("background-color: #c0392b; color: white; padding: 10px; font-weight: bold;")
+                self.log_text.append("[ERROR] Serial connection lost")
+                self.abort_recipe("serial connection lost")
         except Exception:
             pass  # Ignore errors in status check
     
@@ -1500,7 +1655,7 @@ class ALDMainWindow(QMainWindow):
         self.pressure_log_file = open(self.pressure_log_filename, 'w', newline='')
         self.pressure_log_writer = csv.writer(self.pressure_log_file)
         self.pressure_log_writer.writerow([
-            'Timestamp', 'Time_s', 'Pressure', 'Unit', 'Flow_ms'
+            'Timestamp', 'Time_s', 'Pressure_raw', 'Pressure_filtered', 'Unit', 'Flow_ms'
         ])
 
         self.log_text.append(f"[LOG] Temp log: {self.temp_log_filename}")
@@ -1593,15 +1748,18 @@ class ALDMainWindow(QMainWindow):
             )
         
         try:
-            valve_id = int(self.valve_id_input.text())
-            num_pulses = int(self.num_pulses_input.text())
-            pulse_time = int(self.pulse_time_input.text())
-            purge_time = int(self.purge_time_input.text())
-            
-            self.current_recipe.add_valve_step(valve_id, num_pulses, pulse_time, purge_time)
-            self.update_recipe_preview()
-        except ValueError:
-            QMessageBox.warning(self, "Input Error", "Please enter valid valve parameters")
+            # Validate now, not 30 minutes into a run
+            cmd = ValveCommand(
+                valve_id=int(self.valve_id_input.text()),
+                num_pulses=int(self.num_pulses_input.text()),
+                pulse_time_ms=int(self.pulse_time_input.text()),
+                purge_time_ms=int(self.purge_time_input.text()),
+            )
+        except ValueError as e:   # includes pydantic ValidationError
+            QMessageBox.warning(self, "Input Error", f"Please enter valid valve parameters:\n\n{e}")
+            return
+        self.current_recipe.add_valve_step(cmd.valve_id, cmd.num_pulses, cmd.pulse_time_ms, cmd.purge_time_ms)
+        self.update_recipe_preview()
     
     def add_temp_to_recipe(self):
         """Add current temperature settings to recipe"""
@@ -1616,11 +1774,12 @@ class ALDMainWindow(QMainWindow):
             tc3 = int(float(self.tc3_input.text()))
             tc4 = int(float(self.tc4_input.text()))
             tc5 = int(float(self.tc5_input.text()))
-            
-            self.current_recipe.add_temp_step(tc2, tc3, tc4, tc5)
-            self.update_recipe_preview()
-        except ValueError:
-            QMessageBox.warning(self, "Input Error", "Please enter valid temperature parameters")
+            TempCommand(tc2=tc2, tc3=tc3, tc4=tc4, tc5=tc5)
+        except ValueError as e:   # includes pydantic ValidationError
+            QMessageBox.warning(self, "Input Error", f"Please enter valid temperature parameters:\n\n{e}")
+            return
+        self.current_recipe.add_temp_step(tc2, tc3, tc4, tc5)
+        self.update_recipe_preview()
     
     def add_wait_to_recipe(self):
         """Add wait step to recipe"""
@@ -1656,9 +1815,18 @@ class ALDMainWindow(QMainWindow):
             QMessageBox.warning(self, "No Name", "Please enter a recipe name.")
             return
         
+        # An uncaught ValueError in a Qt slot aborts the whole app under PyQt6
+        try:
+            cycles = int(self.recipe_cycles_input.text())
+            if cycles < 1:
+                raise ValueError
+        except ValueError:
+            QMessageBox.warning(self, "Input Error", "Cycles must be a whole number of at least 1.")
+            return
+
         self.current_recipe.name = self.recipe_name_input.text()
         self.current_recipe.description = self.recipe_desc_input.text()
-        self.current_recipe.cycles = int(self.recipe_cycles_input.text())
+        self.current_recipe.cycles = cycles
         
         try:
             self.current_recipe.save()
@@ -1695,10 +1863,11 @@ class ALDMainWindow(QMainWindow):
         
         if ok and recipe_name:
             try:
-                self.current_recipe = Recipe.load(f"recipes/{recipe_name}.json")
+                # Separate from the builder's current_recipe, so editing/clearing the
+                # builder can't change the recipe that's about to run.
+                self.loaded_recipe = Recipe.load(RECIPES_DIR / f"{recipe_name}.json")
                 self.recipe_selector.setText(recipe_name)
-                self.recipe_info.setText(self.current_recipe.get_summary())
-                self.recipe_cycles_input.setText(str(self.current_recipe.cycles))
+                self.recipe_info.setText(self.loaded_recipe.get_summary())
                 self.run_recipe_btn.setEnabled(True)
             except Exception as e:
                 QMessageBox.critical(self, "Load Failed", f"Could not load recipe:\n{e}")
@@ -1781,7 +1950,7 @@ class ALDMainWindow(QMainWindow):
         
     def run_recipe(self):
         """Validate and confirm synchronously, then launch recipe task"""
-        if self.current_recipe is None:
+        if self.loaded_recipe is None:
             QMessageBox.warning(self, "No Recipe", "Please load a recipe first.")
             return
         if self.recipe_running:
@@ -1791,11 +1960,19 @@ class ALDMainWindow(QMainWindow):
             QMessageBox.warning(self, "Busy", "Another operation is in progress. Please wait.")
             return
 
+        # Recipe files can be hand-edited; check every step before heating starts.
+        try:
+            for i, step in enumerate(self.loaded_recipe.steps, 1):
+                validate_step(step)
+        except (ValueError, KeyError) as e:
+            QMessageBox.warning(self, "Invalid Recipe", f"Step {i} is invalid:\n\n{e}")
+            return
+
         total_duration_ms = 0
-        num_cycles = self.current_recipe.cycles
+        num_cycles = self.loaded_recipe.cycles
 
         for cycle in range(num_cycles):
-            for step in self.current_recipe.steps:
+            for step in self.loaded_recipe.steps:
                 if step['type'] == 'valve':
                     total_duration_ms += self.calculate_valve_duration(
                         step['num_pulses'], step['pulse_time'], step['purge_time']
@@ -1805,18 +1982,19 @@ class ALDMainWindow(QMainWindow):
 
         reply = QMessageBox.question(
             self, "Run Recipe",
-            f"Run recipe '{self.current_recipe.name}'?\n\n"
-            f"Steps: {len(self.current_recipe.steps)}\n"
+            f"Run recipe '{self.loaded_recipe.name}'?\n\n"
+            f"Steps: {len(self.loaded_recipe.steps)}\n"
             f"Estimated duration (excl. heat-up): {total_duration_ms/60000:.1f} min\n\n"
             f"You can use Emergency Stop if needed.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
 
         if reply == QMessageBox.StandardButton.Yes:
-            asyncio.create_task(self._run_recipe_coro())
+            # Keep a reference: lets E-stop cancel it, and stops it being garbage-collected
+            self.recipe_task = asyncio.create_task(self._run_recipe_coro())
 
     async def _run_recipe_coro(self):
-        if self.current_recipe is None:
+        if self.loaded_recipe is None:
             QMessageBox.warning(self, "No Recipe", "Please load a recipe first.")
             return
         if self.recipe_running:
@@ -1826,7 +2004,7 @@ class ALDMainWindow(QMainWindow):
             QMessageBox.warning(self, "Busy", "Another operation is in progress. Please wait.")
             return
 
-        num_cycles = getattr(self.current_recipe, "cycles", 1)
+        num_cycles = getattr(self.loaded_recipe, "cycles", 1)
         if num_cycles < 1:
             QMessageBox.warning(self, "Recipe Error", "Recipe cycles must be >= 1.")
             return
@@ -1834,7 +2012,7 @@ class ALDMainWindow(QMainWindow):
         self.recipe_running = True
         self.operation_in_progress = True
         self.run_recipe_btn.setEnabled(False)
-        self.recipe_total_steps = len(self.current_recipe.steps) * num_cycles
+        self.recipe_total_steps = len(self.loaded_recipe.steps) * num_cycles
 
         try:
             global_step = 0
@@ -1842,18 +2020,19 @@ class ALDMainWindow(QMainWindow):
             for cycle in range(1, num_cycles + 1):
                 self.log_text.append(f"[RECIPE] Starting cycle {cycle}/{num_cycles}")
 
-                for local_step, step in enumerate(self.current_recipe.steps, 1):
+                for local_step, step in enumerate(self.loaded_recipe.steps, 1):
                     global_step += 1
                     self.recipe_step_index = global_step
                     self.recipe_step_label.setText(
-                        f"Cycle {cycle}/{num_cycles} | Step {local_step}/{len(self.current_recipe.steps)}"
+                        f"Cycle {cycle}/{num_cycles} | Step {local_step}/{len(self.loaded_recipe.steps)}"
                     )
                     self.log_text.append(
                         f"[RECIPE] Cycle {cycle}/{num_cycles} | "
-                        f"Step {local_step}/{len(self.current_recipe.steps)}: {step['type']}"
+                        f"Step {local_step}/{len(self.loaded_recipe.steps)}: {step['type']}"
                     )
 
                     if step['type'] == 'valve':
+                        self.valve_done_event.clear()
                         await self.controller.valve(
                             step['valve_id'],
                             step['num_pulses'],
@@ -1865,15 +2044,23 @@ class ALDMainWindow(QMainWindow):
                             step['pulse_time'],
                             step['purge_time']
                         ) / 1000
-                        self.log_text.append(f"[RECIPE] Valve running, waiting {duration_sec:.1f}s...")
+                        self.log_text.append(f"[RECIPE] Valve running, ~{duration_sec:.1f}s...")
 
-                        remaining = duration_sec
-                        while remaining > 0:
-                            chunk = min(remaining, 1)
-                            await self.qt_sleep(chunk)
-                            remaining -= chunk
+                        # Wait for the Arduino's "command has completed" message instead of
+                        # a time estimate. Firmware timing drifts a little per pulse, and
+                        # sending the next command early got it silently ignored.
+                        timeout_sec = duration_sec + 30
+                        waited = 0.0
+                        while not self.valve_done_event.is_set():
+                            await self.qt_sleep(0.25)
+                            waited += 0.25
+                            if waited > timeout_sec:
+                                raise Exception(
+                                    f"Valve step timed out after {timeout_sec:.0f}s "
+                                    f"(expected ~{duration_sec:.0f}s). Is the Arduino responding?"
+                                )
                             self.time_remaining_label.setText(
-                                f"Cycle {cycle}/{num_cycles} | {remaining:.0f}s remaining (valve)"
+                                f"Cycle {cycle}/{num_cycles} | ~{max(0, duration_sec - waited):.0f}s remaining (valve)"
                             )
                         self.log_text.append("[RECIPE] Valve step complete")
                         await self.qt_sleep(0.5)
@@ -1923,12 +2110,13 @@ class ALDMainWindow(QMainWindow):
 
                 self.log_text.append(f"[RECIPE] Finished cycle {cycle}/{num_cycles}")
 
-            self.log_text.append(f"[RECIPE] '{self.current_recipe.name}' completed successfully!")
+            self.log_text.append(f"[RECIPE] '{self.loaded_recipe.name}' completed successfully!")
             self.recipe_step_label.setText("Complete")
             self.time_remaining_label.setText("Recipe complete")
 
         except Exception as e:
             self.log_text.append(f"[RECIPE] Error at step {self.recipe_step_index}: {e}")
+            self.time_remaining_label.setText("Failed")
             QMessageBox.critical(
                 self,
                 "Recipe Failed",
@@ -1938,8 +2126,7 @@ class ALDMainWindow(QMainWindow):
             self.recipe_running = False
             self.operation_in_progress = False
             self.run_recipe_btn.setEnabled(True)
-            self.time_remaining_label.setText("Complete")
-    # @asyncSlot()
+
 
     async def qt_sleep(self, seconds):
         """Polling-based sleep compatible with qasync + Python 3.12"""
@@ -1950,134 +2137,6 @@ class ALDMainWindow(QMainWindow):
             # Sleep in small chunks to keep both event loops responsive
             chunk = min(remaining, 0.05)  # 50ms chunks
             await asyncio.sleep(chunk)
-    # async def run_recipe(self):
-    #     if self.current_recipe is None:
-    #         QMessageBox.warning(self, "No Recipe", "Please load a recipe first.")
-    #         return
-        
-    #     if self.recipe_running:
-    #         QMessageBox.warning(self, "Recipe Running", "A recipe is already running.")
-    #         return
-        
-    #     if self.operation_in_progress:
-    #         QMessageBox.warning(self, "Busy", "Another operation is in progress. Please wait.")
-    #         return
-        
-    #     # Calculate total recipe duration for display
-    #     total_duration_ms = 0
-    #     for step in self.current_recipe.steps:
-    #         if step['type'] == 'valve':
-    #             total_duration_ms += self.calculate_valve_duration(
-    #                 step['num_pulses'], step['pulse_time'], step['purge_time']
-    #             )
-    #         elif step['type'] == 'wait':
-    #             total_duration_ms += step['duration'] * 1000
-        
-    #     total_duration_str = f"{total_duration_ms/1000:.0f}s ({total_duration_ms/60000:.1f} min)"
-        
-    #     reply = QMessageBox.question(
-    #         self,
-    #         "Run Recipe",
-    #         f"Run recipe '{self.current_recipe.name}'?\n\n"
-    #         f"Steps: {len(self.current_recipe.steps)}\n"
-    #         f"Estimated duration: {total_duration_str}\n\n"
-    #         f"You can use Emergency Stop if needed.",
-    #         QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-    #     )
-        
-    #     if reply != QMessageBox.StandardButton.Yes:
-    #         return
-        
-    #     self.recipe_running = True
-    #     self.operation_in_progress = True
-    #     self.run_recipe_btn.setEnabled(False)
-    #     self.recipe_total_steps = len(self.current_recipe.steps)
-        
-    #     self.job_total_duration = total_duration_ms + 3000
-    #     self.job_start_time = datetime.now()
-    #     self.progress_bar.setValue(0)
-    #     self.job_timer.start(100)
-        
-    #     try:
-    #         for i, step in enumerate(self.current_recipe.steps, 1):
-    #             self.recipe_step_index = i
-    #             self.recipe_step_label.setText(f"{i}/{self.recipe_total_steps}")
-    #             self.log_text.append(f"[RECIPE] Step {i}/{self.recipe_total_steps}: {step['type']}")
-                
-    #             if step['type'] == 'valve':
-    #                 # Clear the event before sending so we wait for THIS command's completion
-    #                 self.valve_done_event.clear()
-    #                 self.valve_job_running = True
-                    
-    #                 await self.controller.valve(
-    #                     step['valve_id'],
-    #                     step['num_pulses'],
-    #                     step['pulse_time'],
-    #                     step['purge_time']
-    #                 )
-    #                 self.log_text.append(f"[RECIPE] Valve command sent, waiting for completion...")
-                    
-    #                 # Wait for completion signal with a generous timeout
-    #                 valve_duration_sec = self.calculate_valve_duration(
-    #                     step['num_pulses'], step['pulse_time'], step['purge_time']
-    #                 ) / 1000
-    #                 timeout_sec = valve_duration_sec + 30  # 30s grace period
-                    
-    #                 elapsed = 0.0
-    #                 poll_interval = 0.25  # seconds
-    #                 while not self.valve_done_event.is_set():
-    #                     await asyncio.sleep(poll_interval)
-    #                     elapsed += poll_interval
-    #                     if elapsed >= timeout_sec:
-    #                         raise Exception(
-    #                             f"Valve step {i} timed out after {timeout_sec:.0f}s "
-    #                             f"(expected ~{valve_duration_sec:.0f}s)"
-    #                         )
-    #                 self.log_text.append(f"[RECIPE] Valve step complete")
-                
-    #             elif step['type'] == 'temp':
-    #                 await self.controller.temp(
-    #                     step['tc2'], step['tc3'], step['tc4'], step['tc5']
-    #                 )
-    #                 self.temp_setpoints = {
-    #                     'tc2': step['tc2'], 'tc3': step['tc3'],
-    #                     'tc4': step['tc4'], 'tc5': step['tc5']
-    #                 }
-    #                 self.temp_setpoints_initialized = True
-    #                 self.tc2_setpoint_display.setText(f"→ {step['tc2']}°C")
-    #                 self.tc3_setpoint_display.setText(f"→ {step['tc3']}°C")
-    #                 self.tc4_setpoint_display.setText(f"→ {step['tc4']}°C")
-    #                 self.tc5_setpoint_display.setText(f"→ {step['tc5']}°C")
-    #                 self.log_text.append(f"[RECIPE] Temperature step complete")
-                
-    #             elif step['type'] == 'wait':
-    #                 self.log_text.append(f"[RECIPE] Waiting {step['duration']}s...")
-    #                 # Yield to Qt event loop in small chunks so UI stays responsive
-    #                 remaining = step['duration']
-    #                 while remaining > 0:
-    #                     chunk = min(remaining, 1)
-    #                     await asyncio.sleep(chunk)
-    #                     remaining -= chunk
-    #                     # Update time remaining display during wait
-    #                     self.time_remaining_label.setText(f"{remaining}s remaining (wait)")
-    #                 self.log_text.append(f"[RECIPE] Wait complete")
-            
-    #         self.log_text.append(f"[RECIPE] '{self.current_recipe.name}' completed successfully!")
-    #         self.recipe_step_label.setText("Complete")
-    #         QMessageBox.information(self, "Recipe Complete", "Recipe executed successfully!")
-        
-    #     except Exception as e:
-    #         self.log_text.append(f"[RECIPE] Error at step {self.recipe_step_index}: {e}")
-    #         QMessageBox.critical(self, "Recipe Failed", f"Recipe failed at step {self.recipe_step_index}:\n\n{e}")
-        
-    #     finally:
-    #         self.recipe_running = False
-    #         self.operation_in_progress = False
-    #         self.valve_job_running = False
-    #         self.run_recipe_btn.setEnabled(True)
-    #         self.job_timer.stop()
-    #         self.progress_bar.setValue(100)
-    #         self.time_remaining_label.setText("Complete")
     def closeEvent(self, event):
         self.stop_data_logging()
         event.accept()
