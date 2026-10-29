@@ -154,7 +154,13 @@ uint8_t tc_last_err[4] = {0};
 // so it can't outlive the GUI session. Overtemp and idle checks still apply.
 bool tc_fault_bypass = false;
 unsigned long tc_bypass_seen_ms = 0;
-const unsigned long TC_BYPASS_TTL_MS = 90000;   // MAX31855 fault bits: 1=open, 2=short to GND, 4=short to VCC
+const unsigned long TC_BYPASS_TTL_MS = 90000;
+// In bypass, a faulted TC holds only ITS heater off until it reads normally again.
+const int TC_RECOVER_READS = 4;           // consecutive good reads (~2 s) before a held heater may heat again
+const double TC_MIN_VALID_C = 1.0;        // 0 C in a lab = bad read, not a real temperature
+const double TC_MAX_VALID_C = 600.0;
+int tc_good_count[4] = {0};
+bool heater_held[4] = {false};            // index matches TC_NAMES   // MAX31855 fault bits: 1=open, 2=short to GND, 4=short to VCC
 const char *TC_NAMES[4] = {"substrate", "delivery", "prec1", "prec2"};
 
 // -------------------- Standard hysteresis values ----------
@@ -307,11 +313,13 @@ void readThermocouples()
 
     // Keep the last good value for display, but count faults so a dead
     // sensor can't leave its heater running on a frozen reading.
-    if (isnan(curr_val)) {
+    if (isnan(curr_val) || curr_val <= TC_MIN_VALID_C || curr_val > TC_MAX_VALID_C) {
       if (tc_fail_count[i] < 1000) tc_fail_count[i]++;
-      tc_last_err[i] = thermocouples[i].readError();
+      tc_good_count[i] = 0;
+      tc_last_err[i] = isnan(curr_val) ? thermocouples[i].readError() : 0;
     } else {
       tc_fail_count[i] = 0;
+      if (tc_good_count[i] < 1000) tc_good_count[i]++;
       current_reading[i] = curr_val;
     }
   }
@@ -397,6 +405,11 @@ void resetPrecursorControlState(
 // Precursor state is reset too, otherwise a heater can be left with
 // pulse_mode=true and relay off, and never turn back on.
 // ============================================================
+const __FlashStringHelper *faultName(uint8_t e)
+{
+  return e & 1 ? F(" (open circuit)") : e & 2 ? F(" (short to GND)") : e & 4 ? F(" (short to VCC)") : F(" (bad reading)");
+}
+
 void heatersOff(const String &reason)
 {
   digitalWrite(RELAY_SUBSTRATE_PIN, HIGH);
@@ -414,6 +427,7 @@ void heatersOff(const String &reason)
       prec2_current_pulse_on_ms, RELAY_PREC2_PIN);
 
   tc_active = 0;
+  for (int i = 0; i < 4; i++) heater_held[i] = false;
   Serial.println("SAFETY: " + reason + " - HEATERS OFF");
 }
 
@@ -685,9 +699,7 @@ void actuateHeatingElements()
   {
     // A faulted sensor only matters if its heater is in use.
     if (sets[i] > 0 && tc_fail_count[i] >= TC_FAULT_LIMIT && !tc_fault_bypass) {
-      uint8_t e = tc_last_err[i];
-      heatersOff(String(F("thermocouple fault on ")) + TC_NAMES[i] +
-                 (e & 1 ? F(" (open circuit)") : e & 2 ? F(" (short to GND)") : e & 4 ? F(" (short to VCC)") : F(" (no reading)")));
+      heatersOff(String(F("thermocouple fault on ")) + TC_NAMES[i] + faultName(tc_last_err[i]));
       return;
     }
     if (sets[i] > 0 && avgs[i] > sets[i] + OVERTEMP_MARGIN_C) {
@@ -698,6 +710,31 @@ void actuateHeatingElements()
   if (millis() - last_activity_ms >= IDLE_TIMEOUT_MS) {
     heatersOff("idle timeout, no command for " + String(IDLE_TIMEOUT_MS / 60000UL) + " min");
     return;
+  }
+
+  // ---------------- Bypass: per-heater hold on bad readings ----------------
+  for (int i = 0; i < 4; i++)
+  {
+    bool want_hold = tc_fault_bypass && sets[i] > 0 &&
+                     (heater_held[i] ? tc_good_count[i] < TC_RECOVER_READS : tc_fail_count[i] > 0);
+    if (want_hold == heater_held[i]) continue;
+    heater_held[i] = want_hold;
+    if (want_hold) {
+      Serial.print(F("HEATER HOLD: ")); Serial.print(TC_NAMES[i]);
+      Serial.print(faultName(tc_last_err[i])); Serial.println(F(" - off until readings recover"));
+      // Precursor controllers restart from startup mode after a hold.
+      if (i == 2) resetPrecursorControlState(relay_prec1_on, prec1_startup_mode, prec1_startup_pulse_stage,
+          prec1_peak_seen, prec1_temp_rising, prec1_pulse_mode, prec1_force_recovery_mode,
+          prec1_peak_temp, prec1_last_switch_ms, prec1_pulse_start_ms, prec1_last_pulse_end_ms,
+          prec1_current_pulse_on_ms, RELAY_PREC1_PIN);
+      if (i == 3) resetPrecursorControlState(relay_prec2_on, prec2_startup_mode, prec2_startup_pulse_stage,
+          prec2_peak_seen, prec2_temp_rising, prec2_pulse_mode, prec2_force_recovery_mode,
+          prec2_peak_temp, prec2_last_switch_ms, prec2_pulse_start_ms, prec2_last_pulse_end_ms,
+          prec2_current_pulse_on_ms, RELAY_PREC2_PIN);
+    } else {
+      Serial.print(F("HEATER RESUME: ")); Serial.print(TC_NAMES[i]);
+      Serial.println(F(" readings OK - heating to setpoint"));
+    }
   }
 
   // ----------------------------------------------------------
@@ -719,7 +756,7 @@ void actuateHeatingElements()
   // Serial.print(delivery_falling_count);
   // Serial.print(F(" relay="));
   // Serial.println(relay_delivery_on ? "ON" : "OFF");
-  if (temp_set_delivery <= 0)
+  if (temp_set_delivery <= 0 || heater_held[1])
   {
       // Setpoint 0 = heater off. Without this, the peak-drop restart below
       // keeps firing short heat pulses whenever the line cools slightly.
@@ -776,7 +813,7 @@ void actuateHeatingElements()
 
   prev_temp_delivery_avg = temp_delivery_avg;
 
-  controlPrecursorHeater(
+  if (!heater_held[2]) controlPrecursorHeater(
       temp_prec1_avg,
       prev_temp_prec1_avg,
       temp_set_prec1,
@@ -798,7 +835,7 @@ void actuateHeatingElements()
   );
   prev_temp_prec1_avg = temp_prec1_avg;
 
-  controlPrecursorHeater(
+  if (!heater_held[3]) controlPrecursorHeater(
       temp_prec2_avg,
       prev_temp_prec2_avg,
       temp_set_prec2,
@@ -827,7 +864,15 @@ void actuateHeatingElements()
   bool substrate_can_switch =
     (millis() - substrate_last_switch_ms) >= substrate_lockout_ms;
 
-  if (relay_substrate_on)
+  if (heater_held[0])
+  {
+    if (relay_substrate_on) {
+      digitalWrite(RELAY_SUBSTRATE_PIN, HIGH);   // OFF (held, bad readings)
+      relay_substrate_on = false;
+      substrate_last_switch_ms = millis();       // lockout also limits relay chatter
+    }
+  }
+  else if (relay_substrate_on)
   {
     if (substrate_can_switch &&
         temp_substrate_avg >= temp_set_substrate)
