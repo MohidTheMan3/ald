@@ -161,7 +161,7 @@ test_controller.py::TestWithArduino::test_callback SKIPPED (No Arduino)
 | Valve ID | 1-3 | Pydantic model |
 | Number of Pulses | 1-1000 | Pydantic model |
 | Pulse Time | 10-10000 ms | Pydantic model |
-| Purge Time | 0-15000 ms | Pydantic model |
+| Purge Time | 0-60000 ms | Pydantic model |
 | Temperature | 0-500°C | Pydantic model |
 
 ### Known Issues
@@ -298,7 +298,7 @@ Parameters:
 - `valve_id`: 1, 2, or 3
 - `num_pulses`: 1-1000 (number of ALD cycles)
 - `pulse_time_ms`: 10-10000 (precursor exposure time)
-- `purge_time_ms`: 0-15000 (nitrogen purge duration)
+- `purge_time_ms`: 0-60000 (nitrogen purge duration)
 
 #### Temperature Control
 

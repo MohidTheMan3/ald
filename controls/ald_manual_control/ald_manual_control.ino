@@ -1,11 +1,15 @@
 // ald_manual_control.ino
 // Manual control of the ALD system.
 //
-// While running manual_gui.py on the control computer, users can:
+// While running ald_gui.py on the control computer, users can:
 // - set temperature setpoints for heating elements
 // - actuate valves one at a time
+// - run recipes and monitor pressure / flow
 //
-// Useful for testing individual components of the ALD system.
+// TARGET: STM32 board only (3.3 V ADC reference, 12-bit ADC via
+// analogReadResolution(12)). The Arduino Uno/Nano scaling values are kept
+// below, commented out, for reference; building for an Arduino requires
+// restoring them and the /1023.0 ADC math.
 //
 // CMU Hacker Fab 2025
 // Joel Gonzalez, Haewon Uhm, Atharva Raut, Mohid Rattu
@@ -34,16 +38,17 @@
 //   Valve relays are driven HIGH during pulse/open and LOW during purge/closed.
 
 // ============================================================
-// PIN ALLOCATION
+// PIN ALLOCATION (STM32 PCB)
 // 0-1    Reserved (RX,TX)
-// 2      RELAY1 (Substrate heater)
-// 3-10   Thermocouples
-// 11     RELAY2 (Delivery line tape) --> 7
-// 12     RELAY3 (Precursor 1 heater) --> A2
-// A2     RELAY4 (Precursor 2 heater) --> 9
-// A0     Pressure Gauge
-// A1     Flow Sensor
-// A3-A5  Valves
+// 2      Substrate heater relay
+// 3-6    Thermocouple chip-selects (K-type: substrate, delivery, prec 1, prec 2)
+// 7      Delivery line tape relay
+// 8, 10  Unused (former J-type thermocouple CS)
+// 9      Precursor 2 heater relay
+// A0     Pressure gauge
+// A1     Flow sensor
+// A2     Precursor 1 heater relay
+// A3-A5  Valves 1-3
 // ============================================================
 
 // toggle this if you want the system to do nothing
@@ -86,7 +91,7 @@ const double D6FW04A1_LUT[5] = {1.00, 1.58, 2.88, 4.11, 5.00};
 // index 2 (pin 5) -> precursor 1 heater
 // index 3 (pin 6) -> precursor 2 heater
 //
-// J-type thermocouples on pins 7,8,9,10 are currently unused here
+// Pins 7 and 9 are now heater relays; 8 and 10 are unused
 // ============================================================
 
 Adafruit_MAX31855 thermocouples[4] = {
