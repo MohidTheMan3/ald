@@ -8,8 +8,8 @@
 // Useful for testing individual components of the ALD system.
 //
 // CMU Hacker Fab 2025
-// Joel Gonzalez, Haewon Uhm, Atharva Raut
-// Updated 2025-Dec-05
+// Joel Gonzalez, Haewon Uhm, Atharva Raut, Mohid Rattu
+// Updated 2026-Nov-09
 //
 // Serial command protocol:
 //   t<delivery_C>;<prec1_C>;<prec2_C>;<substrate_C>
@@ -38,9 +38,9 @@
 // 0-1    Reserved (RX,TX)
 // 2      RELAY1 (Substrate heater)
 // 3-10   Thermocouples
-// 11     RELAY2 (Delivery line tape)
-// 12     RELAY3 (Precursor 1 heater)
-// A2     RELAY4 (Precursor 2 heater)
+// 11     RELAY2 (Delivery line tape) --> 7
+// 12     RELAY3 (Precursor 1 heater) --> A2
+// A2     RELAY4 (Precursor 2 heater) --> 9
 // A0     Pressure Gauge
 // A1     Flow Sensor
 // A3-A5  Valves
@@ -51,9 +51,9 @@
 
 // -------------------- Heater relay pins --------------------
 #define RELAY_SUBSTRATE_PIN 2
-#define RELAY_DELIVERY_PIN A2
-#define RELAY_PREC1_PIN 9
-#define RELAY_PREC2_PIN 7
+#define RELAY_DELIVERY_PIN 7
+#define RELAY_PREC1_PIN A2
+#define RELAY_PREC2_PIN 9
 
 // -------------------- Valve relay pins ---------------------
 #define RELAY_VALVE1_PIN A3
@@ -65,8 +65,12 @@
 #define FLOW_SENSE_PIN A1
 
 // -------------------- Analog scaling -----------------------
-#define ADC_REF_V 5.0
-#define CVM211_DIVIDER_RATIO 1.622
+// Arduino mappings
+//#define ADC_REF_V 5.0
+//#define CVM211_DIVIDER_RATIO 1.622
+// STM32 mappings
+#define ADC_REF_V 3.308
+#define CVM211_DIVIDER_RATIO 3.213
 #define D6FW_DIVIDER_RATIO 2
 
 const double D6FW04A1_LUT[5] = {1.00, 1.58, 2.88, 4.11, 5.00};
@@ -269,7 +273,7 @@ void setup()
     while (1);
 
   Serial.begin(115200);
-
+  analogReadResolution(12);
   digitalWrite(RELAY_PREC1_PIN, HIGH);   // preload HIGH
   pinMode(RELAY_PREC1_PIN, OUTPUT);      // now becomes OUTPUT already HIGH
   relay_prec1_on = false;
@@ -951,7 +955,8 @@ static double cvm211_readGaugeVolts() {
     uint32_t acc = 0;
     for (int i = 0; i < active_pgauge_samples; ++i) acc += analogRead(PGAUGE_PIN);
     double adcCounts = acc / (double)active_pgauge_samples;
-    double vadc = (adcCounts * ADC_REF_V) / 1023.0;
+    //double vadc = (adcCounts * ADC_REF_V) / 1023.0;
+    double vadc = (adcCounts * ADC_REF_V) / 4095.0;
     double vgauge = vadc * CVM211_DIVIDER_RATIO;
     return vgauge;
 }
@@ -991,7 +996,8 @@ static double d6fw_readGaugeVolts()
   uint32_t acc = 0;
   for (int i = 0; i < num_samples_flow_sense; ++i) acc += analogRead(FLOW_SENSE_PIN);
   double adcCounts = acc / (double)num_samples_flow_sense;
-  double vadc = (adcCounts * ADC_REF_V) / 1023.0;
+  //double vadc = (adcCounts * ADC_REF_V) / 1023.0;
+  double vadc = (adcCounts * ADC_REF_V) / 4095.0;
   double vgauge = vadc * D6FW_DIVIDER_RATIO;
   return vgauge;
 }
